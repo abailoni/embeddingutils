@@ -79,6 +79,210 @@ class EncoderDecoderSkeleton(nn.Module):
         return Identity()
 
 
+class MergePyramid(nn.Module):
+    def __init__(self, conv_type, pyramid_feat, backbone_feat):
+        super(MergePyramid, self).__init__()
+        self.conv = conv_type(backbone_feat, pyramid_feat, kernel_size=1)
+
+    def forward(self, previous_pyramid, backbone):
+        return self.conv(backbone) + previous_pyramid
+
+
+
+class FeaturePyramidUNet3D(EncoderDecoderSkeleton):
+    def __init__(self, depth, in_channels, encoder_fmaps, pyramid_fmaps,
+                 path_autoencoder_model,
+                 scale_factor=2,
+                 conv_type='vanilla',
+                 final_activation=None,
+                 upsampling_mode='nearest',
+                 **kwargs):
+        self.depth = depth
+        self.in_channels = in_channels
+        self.pyramid_fmaps = pyramid_fmaps
+
+        if isinstance(encoder_fmaps, (list, tuple)):
+            self.encoder_fmaps = encoder_fmaps
+        else:
+            assert isinstance(encoder_fmaps, int)
+            if 'fmap_increase' in kwargs:
+                self.fmap_increase = kwargs['fmap_increase']
+                self.encoder_fmaps = [encoder_fmaps + i * self.fmap_increase for i in range(self.depth + 1)]
+            elif 'fmap_factor' in kwargs:
+                self.fmap_factor = kwargs['fmap_factor']
+                self.encoder_fmaps = [encoder_fmaps * self.fmap_factor**i for i in range(self.depth + 1)]
+            else:
+                self.encoder_fmaps = [encoder_fmaps, ] * (self.depth + 1)
+
+        self.final_activation = [final_activation] if final_activation is not None else None
+
+        # parse conv_type
+        if isinstance(conv_type, str):
+            assert conv_type in CONV_TYPES
+            self.conv_type = CONV_TYPES[conv_type]
+        else:
+            assert isinstance(conv_type, type)
+            self.conv_type = conv_type
+
+        # parse scale factor
+        if isinstance(scale_factor, int):
+            scale_factor = [scale_factor, ] * depth
+        scale_factors = scale_factor
+        normalized_factors = []
+        for scale_factor in scale_factors:
+            assert isinstance(scale_factor, (int, list, tuple))
+            if isinstance(scale_factor, int):
+                scale_factor = self.dim * [scale_factor, ]
+            assert len(scale_factor) == self.dim
+            normalized_factors.append(scale_factor)
+        self.scale_factors = normalized_factors
+        self.upsampling_mode = upsampling_mode
+
+        # compute input size divisibiliy constraints
+        divisibility_constraint = np.ones(len(self.scale_factors[0]))
+        for scale_factor in self.scale_factors:
+            divisibility_constraint *= np.array(scale_factor)
+        self.divisibility_constraint = list(divisibility_constraint.astype(int))
+
+
+
+        super(FeaturePyramidUNet3D, self).__init__(depth)
+
+        # self.shortcut_convs = nn.ModuleList([self.build_shortcut_conv(d) for d in range(1,depth)])
+        # self.shortcut_merge = nn.ModuleList([self.build_shortcut_merge(d) for d in range(1, depth)])
+        #
+        # # Convolution producing affinities:
+        # self.final_conv = nn.Sequential(self.construct_conv(self.pyramid_fmaps*3 + 3, self.pyramid_fmaps, kernel_size=1),
+        #                                 self.construct_conv(self.pyramid_fmaps, 1, kernel_size=1))
+        # self.sigmoid = nn.Sigmoid()
+
+        # Load final decoders:
+        assert isinstance(path_autoencoder_model, str)
+        # FIXME: this should be moved to the model, otherwise it's not saved!
+        self.AE_model = [torch.load(path_autoencoder_model),
+                           torch.load(path_autoencoder_model),
+                           torch.load(path_autoencoder_model),]
+
+        for i in range(3):
+            self.AE_model[i].set_min_patch_shape((5,29,29))
+
+            # Freeze the auto-encoder model:
+            # for param in self.AE_model[i].parameters():
+            #     param.requires_grad = False
+
+
+    def build_shortcut_conv(self, depth):
+        # build final bottom-up shortcut:
+        from inferno.extensions.layers import ConvActivation
+        from inferno.extensions.initializers.presets import OrthogonalWeightsZeroBias
+        return ConvActivation(self.pyramid_fmaps, self.pyramid_fmaps, (1,3,3), dim=3,
+                       stride=self.scale_factors[depth],
+                       dilation=(1,3,3),
+                       activation='ELU',
+                       initialization=OrthogonalWeightsZeroBias())
+
+    def build_shortcut_merge(self, depth):
+        return Sum()
+
+    def forward(self, *inputs):
+        input, offsets = inputs
+        encoded_states = []
+        current = input
+        for encode, downsample in zip(self.encoder_modules, self.downsampling_modules):
+            current = encode(current)
+            encoded_states.append(current)
+            current = downsample(current)
+        current = self.base_module(current)
+
+        feature_pyramid = [current]
+        for encoded_state, upsample, skip, merge, decode, depth in reversed(list(zip(
+                encoded_states, self.upsampling_modules, self.skip_modules, self.merge_modules, self.decoder_modules, range(len(self.decoder_modules))))):
+            # if depth == 0:
+            #     break
+            current = upsample(current)
+            current = merge(current, encoded_state)
+            current = decode(current)
+            feature_pyramid.append(current)
+
+        feature_pyramid.reverse()
+        # Bottom-up shortcut:
+        # feature_pyramid_upscaled = [current]
+        # for d, conv, merge  in zip(range(0, self.depth-1), self.shortcut_convs, self.shortcut_merge):
+        #     current = conv(current)
+        #     current = merge(current, feature_pyramid[d])
+        #     # feature_pyramid[d] = current
+        # #     # Upscale:
+        # #     if d == 1:
+        # #         feature_pyramid_upscaled.append(self.upsampling_modules[1](current))
+        # #     elif d == 2:
+        # #         feature_pyramid_upscaled.append(self.upsampling_modules[1](self.upsampling_modules[2](current)))
+        # #     else:
+        # #         raise NotImplementedError("Temp hack, only working with depth 3")
+        # for d in range(1, self.depth):
+        #     # Upscale:
+        #     if d == 1:
+        #         feature_pyramid_upscaled.append(self.upsampling_modules[1](feature_pyramid[d]))
+        #     elif d == 2:
+        #         feature_pyramid_upscaled.append(self.upsampling_modules[1](self.upsampling_modules[2](feature_pyramid[d])))
+        #     else:
+        #         raise NotImplementedError("Temp hack, only working with depth 3")
+
+
+
+        # # Perform final convolution:
+        # concatenated_features = torch.cat(tuple(feature_pyramid_upscaled)+(self.downsampling_modules[0](offsets.float()),), 1)
+        # affinities = self.sigmoid(self.final_conv(concatenated_features))
+        # return [affinities] + feature_pyramid
+        return feature_pyramid
+
+    def construct_merge_module(self, depth):
+        return MergePyramid(self.conv_type, self.pyramid_fmaps, self.encoder_fmaps[depth])
+
+    def construct_encoder_module(self, depth):
+        f_in = self.encoder_fmaps[depth - 1] if depth != 0 else self.in_channels
+        f_out = self.encoder_fmaps[depth]
+        if depth != 0:
+            return nn.Sequential(
+                SuperhumanSNEMIBlock(f_in=f_in, f_out=f_out, conv_type=self.conv_type),
+                SuperhumanSNEMIBlock(f_in=f_out, f_out=f_out, conv_type=self.conv_type)
+            )
+        if depth == 0:
+            return nn.Sequential(
+                SuperhumanSNEMIBlock(f_in=f_in, f_out=f_out, conv_type=self.conv_type,
+                                        pre_kernel_size=(1, 5, 5), inner_kernel_size=(1, 3, 3)),
+                SuperhumanSNEMIBlock(f_in=f_out, f_out=f_out, conv_type=self.conv_type)
+            )
+
+    def construct_decoder_module(self, depth):
+        return self.construct_conv(self.pyramid_fmaps, self.pyramid_fmaps)
+
+    def construct_base_module(self):
+        f_in = self.encoder_fmaps[self.depth - 1]
+        f_intermediate = self.encoder_fmaps[self.depth]
+        f_out = self.pyramid_fmaps
+        return SuperhumanSNEMIBlock(f_in=f_in, f_main=f_intermediate, f_out=f_out, conv_type=self.conv_type)
+
+    @property
+    def dim(self):
+        return 3
+
+    def construct_downsampling_module(self, depth):
+        scale_factor = self.scale_factors[depth]
+        sampler = nn.MaxPool3d(kernel_size=scale_factor,
+                               stride=scale_factor,
+                               padding=0)
+        return sampler
+
+    def construct_upsampling_module(self, depth):
+        scale_factor = self.scale_factors[depth]
+        if scale_factor[0] == 1:
+            assert scale_factor[1] == scale_factor[2]
+        sampler = Upsample(scale_factor=scale_factor, mode=self.upsampling_mode)
+        return sampler
+
+    def construct_conv(self, f_in, f_out, kernel_size=3):
+        return self.conv_type(f_in, f_out, kernel_size=kernel_size)
+
 class UNetSkeleton(EncoderDecoderSkeleton):
 
     def __init__(self, depth, in_channels, out_channels, fmaps, **kwargs):
