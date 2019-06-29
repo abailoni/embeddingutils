@@ -92,6 +92,7 @@ class MergePyramid(nn.Module):
 class FeaturePyramidUNet3D(EncoderDecoderSkeleton):
     def __init__(self, depth, in_channels, encoder_fmaps, pyramid_fmaps,
                  path_autoencoder_model,
+                 AE_kwargs=None,
                  scale_factor=2,
                  conv_type='vanilla',
                  final_activation=None,
@@ -156,15 +157,18 @@ class FeaturePyramidUNet3D(EncoderDecoderSkeleton):
         #                                 self.construct_conv(self.pyramid_fmaps, 1, kernel_size=1))
         # self.sigmoid = nn.Sigmoid()
 
-        # Load final decoders:
-        assert isinstance(path_autoencoder_model, str)
-        # FIXME: this should be moved to the model, otherwise it's not saved!
-        self.AE_model = [torch.load(path_autoencoder_model),
-                           torch.load(path_autoencoder_model),
-                           torch.load(path_autoencoder_model),]
+        from vaeAffs.models.vanilla_vae import AutoEncoder
+        self.AE_model = nn.ModuleList([AutoEncoder(**AE_kwargs)  for _ in range(3)])
+
+        # # Load final decoders:
+        # assert isinstance(path_autoencoder_model, str)
+        # # FIXME: this should be moved to the model, otherwise it's not saved!
+        # self.AE_model = [torch.load(path_autoencoder_model),
+        #                    torch.load(path_autoencoder_model),
+        #                    torch.load(path_autoencoder_model),]
 
         for i in range(3):
-            self.AE_model[i].set_min_patch_shape((5,29,29))
+            self.AE_model[i].set_min_patch_shape(tuple(AE_kwargs.get("patch_size")))
 
             # Freeze the auto-encoder model:
             # for param in self.AE_model[i].parameters():
