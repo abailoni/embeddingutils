@@ -486,6 +486,42 @@ class SuperhumanSNEMINet(UNet3D):
         return SuperhumanSNEMIBlock(f_in=f_in, f_main=f_intermediate, f_out=f_out, conv_type=self.conv_type)
 
 
+class AffinityNet(nn.Module):
+    def __init__(self, path_PyrUNet, nb_offsets, *super_args, **super_kwargs):
+        super(AffinityNet, self).__init__()
+        
+        self.pyr_unet_model = torch.load(path_PyrUNet)["_model"]
+
+        # # Freeze the network parameters:
+        # for param in self.pyr_unet_model.parameters():
+        #     param.requires_grad = False
+
+        nb_pyr_maps = self.pyr_unet_model.pyramid_fmaps 
+        
+        self.final_module = nn.Sequential(
+            SuperhumanSNEMIBlock(f_in=nb_pyr_maps*3, f_out=nb_pyr_maps,
+                                                 conv_type=self.pyr_unet_model.conv_type),
+            SuperhumanSNEMIBlock(f_in=nb_pyr_maps, f_out=nb_pyr_maps,
+                                 conv_type=self.pyr_unet_model.conv_type, dilation=3),
+            SuperhumanSNEMIBlock(f_in=nb_pyr_maps, f_out=nb_offsets,
+                                 conv_type=self.pyr_unet_model.conv_type, dilation=4),
+        )
+        self.sigmoid = nn.Sigmoid()
+        
+        
+    def forward(self, raw):
+        # Hack because this model was trained with affs:
+        with torch.no_grad():
+            feat_pyr = self.pyr_unet_model.forward(*(raw, raw))
+
+        upscaled_feat_pyr = feat_pyr
+        upscaled_feat_pyr[1] = self.pyr_unet_model.upsampling_modules[1](feat_pyr[1])
+        upscaled_feat_pyr[2] = self.pyr_unet_model.upsampling_modules[1](
+            self.pyr_unet_model.upsampling_modules[2](feat_pyr[2]))
+
+        output = self.final_module(torch.cat(tuple(upscaled_feat_pyr[:3]), dim=1))
+        return self.sigmoid(output)
+
 class ShakeShakeSNEMINet(SuperhumanSNEMINet):
 
     def construct_merge_module(self, depth):

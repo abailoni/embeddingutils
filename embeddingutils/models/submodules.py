@@ -59,14 +59,14 @@ class ResBlock(nn.Module):
 class SuperhumanSNEMIBlock(ResBlock):
     def __init__(self, f_in, f_main=None, f_out=None,
                  pre_kernel_size=(1, 3, 3), inner_kernel_size=(3, 3, 3),
-                 conv_type=ConvELU3D):
+                 conv_type=ConvELU3D, dilation=1):
         if f_main is None:
             f_main = f_in
         if f_out is None:
             f_out = f_main
         pre = conv_type(f_in, f_out, kernel_size=pre_kernel_size)
-        inner = nn.Sequential(conv_type(f_out, f_main, kernel_size=inner_kernel_size),
-                              conv_type(f_main, f_out, kernel_size=inner_kernel_size))
+        inner = nn.Sequential(conv_type(f_out, f_main, kernel_size=inner_kernel_size,dilation=dilation),
+                              conv_type(f_main, f_out, kernel_size=inner_kernel_size,dilation=dilation))
         super(SuperhumanSNEMIBlock, self).__init__(pre=pre, inner=inner)
 
 
