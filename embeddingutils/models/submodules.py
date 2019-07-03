@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.nn import init
 from torch import cat
 import numpy as np
+
 try:
     from speedrun.log_anywhere import log_image
 except ImportError:
@@ -18,7 +19,7 @@ class DepthToChannel(nn.Module):
         assert len(input_.shape) == 5, \
             f'input must be 5D tensor of shape (B, C, D, H, W), but got shape {input_.shape}.'
         input_ = input_.permute((0, 2, 1, 3, 4))
-        return input_.contiguous().view((-1, ) + input_.shape[-3:])
+        return input_.contiguous().view((-1,) + input_.shape[-3:])
 
 
 class Normalize(nn.Module):
@@ -65,12 +66,82 @@ class SuperhumanSNEMIBlock(ResBlock):
         if f_out is None:
             f_out = f_main
         pre = conv_type(f_in, f_out, kernel_size=pre_kernel_size)
-        inner = nn.Sequential(conv_type(f_out, f_main, kernel_size=inner_kernel_size,dilation=dilation),
-                              conv_type(f_main, f_out, kernel_size=inner_kernel_size,dilation=dilation))
+        inner = nn.Sequential(conv_type(f_out, f_main, kernel_size=inner_kernel_size, dilation=dilation),
+                              conv_type(f_main, f_out, kernel_size=inner_kernel_size, dilation=dilation))
         super(SuperhumanSNEMIBlock, self).__init__(pre=pre, inner=inner)
 
 
+from inferno.extensions.layers.convolutional import ConvNormActivation
+
+
+class ResBlockAdvanced(nn.Module):
+    def __init__(self, f_in, f_inner=None, f_out=None,
+                 dim=3,
+                 pre_kernel_size=(1, 3, 3), inner_kernel_size=(3, 3, 3),
+                 activation="ReLU",
+                 stride=1,
+                 normalization="GroupNorm",
+                 num_groups_norm=None,
+                 apply_final_activation=True,
+                 upsampling_factor=None,
+                 dilation=1):
+        super(ResBlockAdvanced, self).__init__()
+        f_inner = f_in if f_inner is None else f_inner
+        f_out = f_inner if f_out is None else f_out
+
+        self.apply_final_activation = apply_final_activation
+
+        self.skip_con = None
+        if stride != 1 or f_in != f_out:
+            self.skip_con = ConvNormActivation(f_in, f_out, kernel_size=1, dim=dim,
+                                               activation=activation,
+                                               stride=stride,
+                                               num_groups_norm=num_groups_norm,
+                                               normalization=normalization)
+
+        self.conv1 = ConvNormActivation(f_in, f_inner, kernel_size=pre_kernel_size,
+                                        dim=dim,
+                                        activation=activation,
+                                        num_groups_norm=num_groups_norm,
+                                        normalization=normalization)
+        self.conv2 = ConvNormActivation(f_inner, f_inner,
+                                        kernel_size=inner_kernel_size, dim=dim,
+                                        activation=activation,
+                                        stride=stride,
+                                        dilation=dilation,
+                                        num_groups_norm=num_groups_norm,
+                                        normalization=normalization)
+        self.conv3 = ConvNormActivation(f_inner, f_out, kernel_size=1, dim=dim,
+                                        activation=activation,
+                                        num_groups_norm=num_groups_norm,
+                                        normalization=normalization)
+
+        self.upsampling = None
+        if upsampling_factor is not None:
+            assert len(upsampling_factor) == dim
+            self.upsampling = Upsample(scale_factor=upsampling_factor, mode="nearest")
+
+    def forward(self, input):
+        x = self.conv1(input)
+        x = self.conv2(x)
+        x = self.conv3.normalization(self.conv3.conv(x))
+
+        if self.skip_con is not None:
+            input = self.skip_con.normalization(self.skip_con.conv(input))
+
+        x = x + input
+        if self.apply_final_activation:
+            x = self.conv3.activation(x)
+
+        if self.upsampling is not None:
+            x = self.upsampling(x)
+
+        return x
+
+
 """modified convgru implementation of https://github.com/jacobkimmel/pytorch_convgru"""
+
+
 class ConvGRUCell(nn.Module):
     """
     Generate a convolutional GRU cell
@@ -93,9 +164,7 @@ class ConvGRUCell(nn.Module):
         # init.constant(self.update_gate.bias, 0.)
         # init.constant(self.out_gate.bias, 0.)
 
-
     def forward(self, input_, prev_state):
-
         # get batch and spatial sizes
         batch_size = input_.data.size()[0]
         spatial_size = input_.data.size()[2:]
@@ -141,7 +210,7 @@ class ConvGRU(nn.Module):
             assert len(kernel_sizes) == n_layers, '`kernel_sizes` must have the same length as n_layers'
             self.kernel_sizes = kernel_sizes
         else:
-            self.kernel_sizes = [kernel_sizes]*n_layers
+            self.kernel_sizes = [kernel_sizes] * n_layers
 
         self.n_layers = n_layers
 
@@ -198,7 +267,7 @@ class ShakeShakeFn(torch.autograd.Function):
     def forward(ctx, x1, x2, training=True):
         # first dim is assumed to be batch
         if training:
-            alpha = torch.rand(x1.size(0), *((1,)*(len(x1.shape)-1)), dtype=x1.dtype, device=x1.device)
+            alpha = torch.rand(x1.size(0), *((1,) * (len(x1.shape) - 1)), dtype=x1.dtype, device=x1.device)
         else:
             alpha = 0.5
         return alpha * x1 + (1 - alpha) * x2
@@ -281,8 +350,8 @@ class HierarchicalAffinityAveraging(torch.nn.Module):
         """ averages iteratively with thrice as long offsets in every level """
         super(HierarchicalAffinityAveraging, self).__init__()
 
-        self.base_neighborhood = stride * np.mgrid[dim*(slice(-1, 2),)].reshape(dim, -1).transpose()
-        self.stages = nn.ModuleList([AffinityBasedAveraging(3**i * self.base_neighborhood, **kwargs)
+        self.base_neighborhood = stride * np.mgrid[dim * (slice(-1, 2),)].reshape(dim, -1).transpose()
+        self.stages = nn.ModuleList([AffinityBasedAveraging(3 ** i * self.base_neighborhood, **kwargs)
                                      for i in range(levels)])
         self.levels = levels
         self.dim = dim
@@ -296,7 +365,7 @@ class HierarchicalAffinityAveraging(torch.nn.Module):
 
         affinity_groups = input[:, :len(self.base_neighborhood) * self.levels]
         affinity_groups = affinity_groups.reshape(
-            input.size(0), self.levels, len(self.base_neighborhood), *input.shape[2:])\
+            input.size(0), self.levels, len(self.base_neighborhood), *input.shape[2:]) \
             .permute(1, 0, *range(2, 3 + self.dim))
         embedding = input[:, len(self.base_neighborhood) * self.levels:]
         for i, (affinities, stage) in enumerate(zip(affinity_groups, self.stages)):
@@ -308,7 +377,6 @@ class HierarchicalAffinityAveraging(torch.nn.Module):
 
 
 if __name__ == '__main__':
-
     model = AffinityBasedAveraging(offsets=np.array([[0, 1], [1, 0]]))
     emb = torch.tensor([[[
         [0, 1],
@@ -328,7 +396,6 @@ if __name__ == '__main__':
 
     assert False
 
-
     from inferno.extensions.layers.convolutional import ConvELU2D, Conv2D, BNReLUConv2D
 
     a = torch.rand(3, 3).requires_grad_(True)
@@ -340,8 +407,6 @@ if __name__ == '__main__':
     b.sum().backward()
     print(a.grad)
     assert False
-
-
 
     model = ConvGRU(4, 8, (3, 5, 3), 3, Conv2D)
 

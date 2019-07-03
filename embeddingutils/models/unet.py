@@ -6,7 +6,7 @@ from inferno.extensions.layers.sampling import AnisotropicPool, AnisotropicUpsam
 from inferno.extensions.layers.reshape import Concatenate, Sum
 
 from embeddingutils.models.submodules import SuperhumanSNEMIBlock, ConvGRU, ShakeShakeMerge, Upsample
-
+from embeddingutils.models.submodules import ResBlockAdvanced
 
 import torch
 import torch.nn as nn
@@ -174,6 +174,13 @@ class FeaturePyramidUNet3D(EncoderDecoderSkeleton):
             # for param in self.AE_model[i].parameters():
             #     param.requires_grad = False
 
+        self.fix_batchnorm_problem()
+
+    def fix_batchnorm_problem(self):
+        for m in self.modules():
+            if isinstance(m, (nn.BatchNorm3d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     def build_shortcut_conv(self, depth):
         # build final bottom-up shortcut:
@@ -247,25 +254,54 @@ class FeaturePyramidUNet3D(EncoderDecoderSkeleton):
         f_out = self.encoder_fmaps[depth]
         if depth != 0:
             return nn.Sequential(
-                SuperhumanSNEMIBlock(f_in=f_in, f_out=f_out, conv_type=self.conv_type),
-                SuperhumanSNEMIBlock(f_in=f_out, f_out=f_out, conv_type=self.conv_type)
+                ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 ),
+                ResBlockAdvanced(f_out, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 ),
+                # ResBlockAdvanced(f_out, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                #                  inner_kernel_size=(3, 3, 3),
+                #                  activation="ReLU",
+                #                  normalization="GroupNorm",
+                #                  num_groups_norm=15,  # TODO: generalize
+                #                  ),
             )
         if depth == 0:
-            return nn.Sequential(
-                SuperhumanSNEMIBlock(f_in=f_in, f_out=f_out, conv_type=self.conv_type,
-                                        pre_kernel_size=(1, 5, 5), inner_kernel_size=(1, 3, 3)),
-                SuperhumanSNEMIBlock(f_in=f_out, f_out=f_out, conv_type=self.conv_type)
-            )
+            return ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 5, 5),
+                                 inner_kernel_size=(1, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=10,  # TODO: generalize
+                                 )
 
     def construct_decoder_module(self, depth):
-        return self.construct_conv(self.pyramid_fmaps, self.pyramid_fmaps)
+        return ResBlockAdvanced(self.pyramid_fmaps, f_inner=self.pyramid_fmaps, 
+                                pre_kernel_size=(1, 1, 1),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 )
 
     def construct_base_module(self):
         f_in = self.encoder_fmaps[self.depth - 1]
         f_intermediate = self.encoder_fmaps[self.depth]
         f_out = self.pyramid_fmaps
-        return SuperhumanSNEMIBlock(f_in=f_in, f_main=f_intermediate, f_out=f_out, conv_type=self.conv_type)
-
+        return ResBlockAdvanced(f_in, f_inner=f_intermediate,
+                                f_out=f_out,
+                                pre_kernel_size=(1, 3, 3),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 )
     @property
     def dim(self):
         return 3
