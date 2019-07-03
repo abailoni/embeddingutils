@@ -83,6 +83,7 @@ class ResBlockAdvanced(nn.Module):
                  normalization="GroupNorm",
                  num_groups_norm=None,
                  apply_final_activation=True,
+                 apply_final_normalization=True,
                  upsampling_factor=None,
                  dilation=1):
         super(ResBlockAdvanced, self).__init__()
@@ -90,6 +91,7 @@ class ResBlockAdvanced(nn.Module):
         f_out = f_inner if f_out is None else f_out
 
         self.apply_final_activation = apply_final_activation
+        self.apply_final_normalization = apply_final_normalization
 
         self.skip_con = None
         if stride != 1 or f_in != f_out:
@@ -124,10 +126,14 @@ class ResBlockAdvanced(nn.Module):
     def forward(self, input):
         x = self.conv1(input)
         x = self.conv2(x)
-        x = self.conv3.normalization(self.conv3.conv(x))
+        x = self.conv3.conv(x)
+        if self.apply_final_normalization and self.conv3.normalization is not None:
+            x = self.conv3.normalization(x)
 
         if self.skip_con is not None:
-            input = self.skip_con.normalization(self.skip_con.conv(input))
+            input = self.skip_con.conv(input)
+            if self.apply_final_normalization and self.skip_con.normalization is not None:
+                input = self.skip_con.normalization(input)
 
         x = x + input
         if self.apply_final_activation:

@@ -535,13 +535,22 @@ class AffinityNet(nn.Module):
         nb_pyr_maps = self.pyr_unet_model.pyramid_fmaps
         
         self.final_module = nn.Sequential(
-            SuperhumanSNEMIBlock(f_in=nb_pyr_maps*3, f_out=nb_pyr_maps,
-                                                 conv_type=self.pyr_unet_model.conv_type),
-            SuperhumanSNEMIBlock(f_in=nb_pyr_maps, f_out=nb_pyr_maps,
-                                 conv_type=self.pyr_unet_model.conv_type, dilation=3),
-            SuperhumanSNEMIBlock(f_in=nb_pyr_maps, f_out=nb_offsets,
-                                 conv_type=self.pyr_unet_model.conv_type, dilation=4),
+            ResBlockAdvanced(f_in=nb_pyr_maps*3, f_out=nb_pyr_maps,pre_kernel_size=(1,3,3),
+                             inner_kernel_size=(1,3,3),num_groups_norm=16),
+            ResBlockAdvanced(f_in=nb_pyr_maps, f_out=nb_pyr_maps, pre_kernel_size=(1, 3, 3),
+                             inner_kernel_size=(3, 3, 3), num_groups_norm=16, dilation=3),
+            ResBlockAdvanced(f_in=nb_pyr_maps, f_out=nb_offsets, pre_kernel_size=(1, 3, 3),
+                             inner_kernel_size=(3, 3, 3), num_groups_norm=16, dilation=4,
+                             apply_final_activation=False,
+                             apply_final_normalization=False),
+            # SuperhumanSNEMIBlock(f_in=nb_pyr_maps*3, f_out=nb_pyr_maps,
+            #                                      conv_type=self.pyr_unet_model.conv_type),
+            # SuperhumanSNEMIBlock(f_in=nb_pyr_maps, f_out=nb_pyr_maps,
+            #                      conv_type=self.pyr_unet_model.conv_type, dilation=3),
+            # SuperhumanSNEMIBlock(f_in=nb_pyr_maps, f_out=nb_offsets,
+            #                      conv_type=self.pyr_unet_model.conv_type, dilation=4),
         )
+
         self.sigmoid = nn.Sigmoid()
         
         
