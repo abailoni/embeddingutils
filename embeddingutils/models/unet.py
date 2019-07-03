@@ -496,7 +496,7 @@ class AffinityNet(nn.Module):
         # for param in self.pyr_unet_model.parameters():
         #     param.requires_grad = False
 
-        nb_pyr_maps = self.pyr_unet_model.pyramid_fmaps 
+        nb_pyr_maps = self.pyr_unet_model.pyramid_fmaps
         
         self.final_module = nn.Sequential(
             SuperhumanSNEMIBlock(f_in=nb_pyr_maps*3, f_out=nb_pyr_maps,
@@ -521,6 +521,42 @@ class AffinityNet(nn.Module):
 
         output = self.final_module(torch.cat(tuple(upscaled_feat_pyr[:3]), dim=1))
         return self.sigmoid(output)
+
+
+
+class MaskUNet(UNet3D):
+    def __init__(self, path_PyrUNet, *super_args, **super_kwargs):
+        pyr_unet_model = torch.load(path_PyrUNet)["_model"]
+        nb_pyr_maps = pyr_unet_model.pyramid_fmaps
+        
+        super_kwargs["in_channels"] = nb_pyr_maps*3 + super_kwargs.get("out_channels", 1)
+        super_kwargs["out_channels"] = super_kwargs.get("out_channels", 1)
+        super_kwargs["final_activation"] = nn.Sigmoid()
+        
+        super(MaskUNet, self).__init__(*super_args, **super_kwargs)
+
+        self.pyr_unet_model = pyr_unet_model
+
+
+    def forward(self, *inputs):
+        raw, mask = inputs
+        
+        # Hack because this model was trained with affs:
+        with torch.no_grad():
+            feat_pyr = self.pyr_unet_model.forward(*(raw, raw))
+
+        # Upscale:
+        upscaled_feat_pyr = feat_pyr
+        upscaled_feat_pyr[1] = self.pyr_unet_model.upsampling_modules[1](feat_pyr[1])
+        upscaled_feat_pyr[2] = self.pyr_unet_model.upsampling_modules[1](
+            self.pyr_unet_model.upsampling_modules[2](feat_pyr[2]))
+
+        
+        out = super(MaskUNet, self).forward(torch.cat(tuple(upscaled_feat_pyr[:3]) + (mask,), dim=1))
+        out = super(MaskUNet, self).forward(torch.cat(tuple(upscaled_feat_pyr[:3]) + (out,), dim=1))
+        # out = super(MaskUNet, self).forward(torch.cat(tuple(upscaled_feat_pyr[:3]) + (out,), dim=1))
+
+        return out
 
 class ShakeShakeSNEMINet(SuperhumanSNEMINet):
 
