@@ -87,17 +87,179 @@ class MergePyramid(nn.Module):
     def forward(self, previous_pyramid, backbone):
         return self.conv(backbone) + previous_pyramid
 
+class StackedPyrHourGlass(nn.Module):
+    def __init__(self,
+                 nb_stacked,
+                 in_channels,
+                 pyramid_fmaps=128, 
+                 stack_scaling_factors=((1,2,2), (1,2,2), (1,2,2)),
+                 pyramidNet_kwargs=None,
+                 patchNet_kwargs=None,
+                 scale_spec_patchNet_kwargs=None
+                 ):
+        super(StackedPyrHourGlass, self).__init__()
+        self.nb_stacked = nb_stacked
+        
+        # Build stacked pyramid models:
+        from copy import deepcopy
+        pyramidNet_kwargs["in_channels"] = in_channels + pyramid_fmaps
+        pyramidNet_kwargs["pyramid_fmaps"] = pyramid_fmaps
+        self.pyr_kwargs = [deepcopy(pyramidNet_kwargs) for _ in range(nb_stacked)]
+        self.pyr_kwargs[0]["in_channels"] = in_channels
+        self.pyr_models = nn.ModuleList([
+            NewFeaturePyramidUNet3D(**kwrg) for kwrg in self.pyr_kwargs
+        ])
+        
+        # Build patchNets:
+        patchNet_kwargs["latent_variable_size"] = pyramid_fmaps
+        self.ptch_kwargs = [deepcopy(patchNet_kwargs) for _ in range(nb_stacked)]
+        if scale_spec_patchNet_kwargs is not None:
+            assert len(scale_spec_patchNet_kwargs) == nb_stacked
+            for i in range(nb_stacked):
+                self.ptch_kwargs[i]["output_shape"] = scale_spec_patchNet_kwargs[i]["patch_size"]
+                # self.ptch_kwargs[i].update(scale_spec_patchNet_kwargs[i])
+        self.patch_models = nn.ModuleList([
+            PatchNet(**kwgs) for kwgs in self.ptch_kwargs
+        ])
+
+        # Build crop-modules:
+        assert len(stack_scaling_factors) == nb_stacked
+        self.stack_scaling_factors = stack_scaling_factors
+        from vaeAffs.transforms import DownsampleAndCrop3D
+        self.crop_transforms = [DownsampleAndCrop3D(zoom_factor=(1, 1, 1),
+                                                    crop_factor=scl_fact) for scl_fact in stack_scaling_factors]
+
+        self.upsample_modules = nn.ModuleList([
+            Upsample(scale_factor=tuple(scl_fact), mode="nearest") for scl_fact in stack_scaling_factors
+        ])
+
+        self.fix_batchnorm_problem()
+
+    def fix_batchnorm_problem(self):
+        for m in self.modules():
+            if isinstance(m, (nn.BatchNorm3d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, *inputs):
+        LIMIT_STACK = 1
+        
+        assert len(inputs) == self.nb_stacked
+
+        # Apply stacked models:
+        current = None
+        output_features = []
+        i = 0
+        for input, pyr_module, crop_transf, upsample in zip(inputs, self.pyr_models, self.crop_transforms,
+                                                            self.upsample_modules):
+            if current is None:
+                current = input
+            else:
+                # Concatenate outputs to higher-res image:
+                current = torch.cat((input, current), dim=1)
+            current = pyr_module(current)[0] # Get only the highest pyramid
+            # Save for loss:
+            output_features.append(current)
+            # Crop output:
+            current = crop_transf.apply_to_torch_tensor(current)
+            current = upsample(current)
+            
+            i += 1
+            if i >= LIMIT_STACK:
+                break
+            
+        return output_features
+
+class CropVolumeModule(nn.Module):
+    def __init__(self, scaling_factor):
+        # TODO: this does not need to be a module...
+        super(CropVolumeModule, self).__init__()
+        assert len(scaling_factor) == 3
+        self.scaling_factor = scaling_factor
+
+    def forward(self, tensor):
+        ndim = len(tensor.shape)
+        crop_slc = tuple(slice(None) for _ in range(ndim-3)) + tuple(slice(crop[0], crop[1]) for crop in self.scaling_factor)
+        return tensor[crop_slc]
+
+
+
+
+class PatchNet(nn.Module):
+    def __init__(self,
+                 latent_variable_size=128,
+                 output_shape=(5, 29, 29),
+                 downscaling_factor=(1, 2, 2),
+                 feature_maps=16):
+        super(PatchNet, self).__init__()
+        output_shape = tuple(output_shape) if isinstance(output_shape, list) else output_shape
+        downscaling_factor = tuple(downscaling_factor) if isinstance(downscaling_factor, list) else downscaling_factor
+        assert isinstance(downscaling_factor, tuple)
+
+        output_shape = tuple(output_shape) if isinstance(output_shape, list) else output_shape
+        assert isinstance(output_shape, tuple)
+        self.output_shape = output_shape
+        assert all(sh % 2 == 1 for sh in output_shape), "Patch should have even dimensions"
+
+        self.min_path_shape = tuple(int(sh / dws) for sh, dws in zip(output_shape, downscaling_factor))
+        self.vectorized_shape = np.array(self.min_path_shape).prod()
+
+        # Build layers:
+        self.linear_base = nn.Linear(latent_variable_size, self.vectorized_shape * feature_maps)
+
+        self.upsampling = Upsample(scale_factor=downscaling_factor, mode="nearest")
+
+        assert feature_maps % 2 == 0, "Necessary for group norm"
+        self.decoder_module = ResBlockAdvanced(feature_maps, f_inner=feature_maps,
+                                               f_out=1,
+                                               dim=3,
+                                               pre_kernel_size=(1, 3, 3),
+                                               inner_kernel_size=(3, 3, 3),
+                                               activation="ReLU",
+                                               normalization="GroupNorm",
+                                               num_groups_norm=2,
+                                               apply_final_activation=False,
+                                               apply_final_normalization=False)
+        self.final_activation = nn.Sigmoid()
+
+    def forward(self, encoded_variable):
+        x = self.linear_base(encoded_variable)
+        N = x.shape[0]
+        reshaped = x.view(N, -1, *self.min_path_shape)
+
+        upsampled = self.upsampling(reshaped) 
+        
+        # Pad to correct shape:
+        padding = [[0,0], [0,0], [0,0]]
+        to_be_padded = False
+        for d in range(3):
+            diff = self.output_shape[d] - upsampled.shape[d - 3]
+            if diff != 0:
+                padding[d][0] = diff
+                to_be_padded = True
+        if to_be_padded:
+            padding.reverse() # Pytorch expect the opposite order
+            padding = [tuple(pad) for pad in padding]
+            upsampled = nn.functional.pad(upsampled, padding[0]+padding[1]+padding[2], mode='replicate')
+
+        conved = self.decoder_module(upsampled)
+
+        return self.final_activation(conved)
+
+
+
+
 
 
 class FeaturePyramidUNet3D(EncoderDecoderSkeleton):
     def __init__(self, depth, in_channels, encoder_fmaps, pyramid_fmaps,
-                 path_autoencoder_model,
                  AE_kwargs=None,
                  scale_factor=2,
                  conv_type='vanilla',
                  final_activation=None,
                  upsampling_mode='nearest',
                  **kwargs):
+        # TODO: improve this crap
         self.depth = depth
         self.in_channels = in_channels
         self.pyramid_fmaps = pyramid_fmaps
@@ -322,6 +484,110 @@ class FeaturePyramidUNet3D(EncoderDecoderSkeleton):
 
     def construct_conv(self, f_in, f_out, kernel_size=3):
         return self.conv_type(f_in, f_out, kernel_size=kernel_size)
+
+class NewFeaturePyramidUNet3D(FeaturePyramidUNet3D):
+    def __init__(self, depth, in_channels, encoder_fmaps, pyramid_fmaps,
+                 scale_factor=2,
+                 conv_type='vanilla',
+                 final_activation=None,
+                 upsampling_mode='nearest',
+                 **kwargs):
+        # TODO: improve this crap
+        self.depth = depth
+        self.in_channels = in_channels
+        self.pyramid_fmaps = pyramid_fmaps
+
+        if isinstance(encoder_fmaps, (list, tuple)):
+            self.encoder_fmaps = encoder_fmaps
+        else:
+            assert isinstance(encoder_fmaps, int)
+            if 'fmap_increase' in kwargs:
+                self.fmap_increase = kwargs['fmap_increase']
+                self.encoder_fmaps = [encoder_fmaps + i * self.fmap_increase for i in range(self.depth + 1)]
+            elif 'fmap_factor' in kwargs:
+                self.fmap_factor = kwargs['fmap_factor']
+                self.encoder_fmaps = [encoder_fmaps * self.fmap_factor ** i for i in range(self.depth + 1)]
+            else:
+                self.encoder_fmaps = [encoder_fmaps, ] * (self.depth + 1)
+
+        self.final_activation = [final_activation] if final_activation is not None else None
+
+        # parse conv_type
+        if isinstance(conv_type, str):
+            assert conv_type in CONV_TYPES
+            self.conv_type = CONV_TYPES[conv_type]
+        else:
+            assert isinstance(conv_type, type)
+            self.conv_type = conv_type
+
+        # parse scale factor
+        if isinstance(scale_factor, int):
+            scale_factor = [scale_factor, ] * depth
+        scale_factors = scale_factor
+        normalized_factors = []
+        for scale_factor in scale_factors:
+            assert isinstance(scale_factor, (int, list, tuple))
+            if isinstance(scale_factor, int):
+                scale_factor = self.dim * [scale_factor, ]
+            assert len(scale_factor) == self.dim
+            normalized_factors.append(scale_factor)
+        self.scale_factors = normalized_factors
+        self.upsampling_mode = upsampling_mode
+
+        # compute input size divisibiliy constraints
+        divisibility_constraint = np.ones(len(self.scale_factors[0]))
+        for scale_factor in self.scale_factors:
+            divisibility_constraint *= np.array(scale_factor)
+        self.divisibility_constraint = list(divisibility_constraint.astype(int))
+
+        super(FeaturePyramidUNet3D, self).__init__(depth)
+
+
+    def forward(self, input):
+        return super(NewFeaturePyramidUNet3D, self).forward(*(input, input))
+
+
+    def construct_encoder_module(self, depth):
+        f_in = self.encoder_fmaps[depth - 1] if depth != 0 else self.in_channels
+        f_out = self.encoder_fmaps[depth]
+        if depth != 0:
+            return nn.Sequential(
+                ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 ),
+            )
+        if depth == 0:
+            return ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 5, 5),
+                                 inner_kernel_size=(1, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 )
+
+    def construct_decoder_module(self, depth):
+        return ResBlockAdvanced(self.pyramid_fmaps, f_inner=self.pyramid_fmaps,
+                                pre_kernel_size=(1, 1, 1),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 )
+
+    def construct_base_module(self):
+        f_in = self.encoder_fmaps[self.depth - 1]
+        f_intermediate = self.encoder_fmaps[self.depth]
+        f_out = self.pyramid_fmaps
+        return ResBlockAdvanced(f_in, f_inner=f_intermediate,
+                                f_out=f_out,
+                                pre_kernel_size=(1, 3, 3),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 )
 
 class UNetSkeleton(EncoderDecoderSkeleton):
 
