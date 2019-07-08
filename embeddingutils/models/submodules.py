@@ -316,7 +316,10 @@ class Upsample(nn.Module):
         self.scale_factor = scale_factor
 
     def forward(self, input):
-        return nn.functional.interpolate(input, scale_factor=self.scale_factor, mode=self.mode)
+        if self.mode != "nearest":
+            return nn.functional.interpolate(input, scale_factor=self.scale_factor, mode=self.mode, align_corners=False)
+        else:
+            return nn.functional.interpolate(input, scale_factor=self.scale_factor, mode=self.mode)
 
 
 class AffinityBasedAveraging(torch.nn.Module):

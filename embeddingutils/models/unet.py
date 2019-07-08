@@ -95,11 +95,13 @@ class StackedPyrHourGlass(nn.Module):
                  stack_scaling_factors=((1,2,2), (1,2,2), (1,2,2)),
                  pyramidNet_kwargs=None,
                  patchNet_kwargs=None,
-                 scale_spec_patchNet_kwargs=None
+                 scale_spec_patchNet_kwargs=None,
+                 trained_depths=None
                  ):
         super(StackedPyrHourGlass, self).__init__()
         self.nb_stacked = nb_stacked
-        
+        self.trained_depths = trained_depths
+
         # Build stacked pyramid models:
         from copy import deepcopy
         pyramidNet_kwargs["in_channels"] = in_channels + pyramid_fmaps
@@ -130,7 +132,7 @@ class StackedPyrHourGlass(nn.Module):
                                                     crop_factor=scl_fact) for scl_fact in stack_scaling_factors]
 
         self.upsample_modules = nn.ModuleList([
-            Upsample(scale_factor=tuple(scl_fact), mode="nearest") for scl_fact in stack_scaling_factors
+            Upsample(scale_factor=tuple(scl_fact), mode="trilinear") for scl_fact in stack_scaling_factors
         ])
 
         self.fix_batchnorm_problem()
@@ -142,7 +144,7 @@ class StackedPyrHourGlass(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, *inputs):
-        LIMIT_STACK = 1
+        LIMIT_STACK = 5
         
         assert len(inputs) == self.nb_stacked
 
@@ -157,9 +159,12 @@ class StackedPyrHourGlass(nn.Module):
             else:
                 # Concatenate outputs to higher-res image:
                 current = torch.cat((input, current), dim=1)
-            current = pyr_module(current)[0] # Get only the highest pyramid
+            pyramids = pyr_module(current)[:3] # Get only the highest pyramid
             # Save for loss:
-            output_features.append(current)
+            output_features += pyramids
+            # output_features.append(pyramids)
+            # Detach the gradient between pyramids for the moment:
+            current = pyramids[0].detach()
             # Crop output:
             current = crop_transf.apply_to_torch_tensor(current)
             current = upsample(current)
@@ -227,20 +232,22 @@ class PatchNet(nn.Module):
         N = x.shape[0]
         reshaped = x.view(N, -1, *self.min_path_shape)
 
-        upsampled = self.upsampling(reshaped) 
-        
-        # Pad to correct shape:
-        padding = [[0,0], [0,0], [0,0]]
-        to_be_padded = False
-        for d in range(3):
-            diff = self.output_shape[d] - upsampled.shape[d - 3]
-            if diff != 0:
-                padding[d][0] = diff
-                to_be_padded = True
-        if to_be_padded:
-            padding.reverse() # Pytorch expect the opposite order
-            padding = [tuple(pad) for pad in padding]
-            upsampled = nn.functional.pad(upsampled, padding[0]+padding[1]+padding[2], mode='replicate')
+        # FIXME
+        # upsampled = self.upsampling(reshaped)
+        upsampled = reshaped
+
+        # # Pad to correct shape:
+        # padding = [[0,0], [0,0], [0,0]]
+        # to_be_padded = False
+        # for d in range(3):
+        #     diff = self.output_shape[d] - upsampled.shape[d - 3]
+        #     if diff != 0:
+        #         padding[d][0] = diff
+        #         to_be_padded = True
+        # if to_be_padded:
+        #     padding.reverse() # Pytorch expect the opposite order
+        #     padding = [tuple(pad) for pad in padding]
+        #     upsampled = nn.functional.pad(upsampled, padding[0]+padding[1]+padding[2], mode='replicate')
 
         conved = self.decoder_module(upsampled)
 
