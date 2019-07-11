@@ -175,6 +175,10 @@ class StackedPyrHourGlass(nn.Module):
             
         return output_features
 
+    def crop_and_upsample(self, tensor, stack_depth):
+        tensor = self.crop_transforms[stack_depth].apply_to_torch_tensor(tensor)
+        return self.upsample_modules[stack_depth](tensor)
+
 class CropVolumeModule(nn.Module):
     def __init__(self, scaling_factor):
         # TODO: this does not need to be a module...
@@ -841,6 +845,42 @@ class AffinityNet(nn.Module):
         return self.sigmoid(output)
 
 
+class StackedAffinityNet(nn.Module):
+    def __init__(self, path_model, nb_offsets, *super_args, **super_kwargs):
+        super(StackedAffinityNet, self).__init__()
+
+        self.stacked_model = torch.load(path_model)["_model"]
+
+        nb_pyr_maps = self.stacked_model.pyr_models[0].pyramid_fmaps
+
+        self.final_module = nn.Sequential(
+            Conv3D(in_channels=nb_pyr_maps * 3, out_channels=nb_offsets,
+                   kernel_size=(1, 5, 5))
+            # ResBlockAdvanced(f_in=nb_pyr_maps * 3, f_inner=nb_pyr_maps, f_out=nb_offsets, pre_kernel_size=(1, 3, 3),
+            #                  inner_kernel_size=(1, 3, 3), num_groups_norm=16, dilation=4,
+            #                  apply_final_activation=False,
+            #                  apply_final_normalization=False),
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, *raw):
+        # Hack because this model was trained with affs:
+        mdl = self.stacked_model
+
+        with torch.no_grad():
+            feat_pyr = mdl(*raw)
+
+        # FIXME:
+        upscaled_feat_pyr = [feat_pyr[0],
+                             feat_pyr[3],
+                             feat_pyr[6],]
+
+        upscaled_feat_pyr[0] = mdl.crop_and_upsample(mdl.crop_and_upsample(upscaled_feat_pyr[0], 0), 1)
+        upscaled_feat_pyr[1] = mdl.crop_and_upsample(upscaled_feat_pyr[1], 1)
+
+        output = self.final_module(torch.cat(tuple(upscaled_feat_pyr[:3]), dim=1))
+        return self.sigmoid(output)
 
 class MaskUNet(UNet3D):
     def __init__(self, path_PyrUNet, *super_args, **super_kwargs):
