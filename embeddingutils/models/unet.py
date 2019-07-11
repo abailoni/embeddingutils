@@ -10,6 +10,8 @@ from embeddingutils.models.submodules import ResBlockAdvanced
 
 import torch
 import torch.nn as nn
+from copy import deepcopy
+from inferno.extensions.layers.convolutional import ConvNormActivation
 
 import numpy as np
 
@@ -87,6 +89,19 @@ class MergePyramid(nn.Module):
     def forward(self, previous_pyramid, backbone):
         return self.conv(backbone) + previous_pyramid
 
+class MergePyramidNew(nn.Module):
+    def __init__(self, pyramid_feat, backbone_feat):
+        super(MergePyramidNew, self).__init__()
+        self.conv = ConvNormActivation(backbone_feat, pyramid_feat, kernel_size=(1, 1, 1),
+                                  dim=3,
+                                       activation="ReLU",
+                                       normalization="GroupNorm",
+                                       num_groups_norm=16)
+
+    def forward(self, previous_pyramid, backbone):
+        return self.conv(backbone) + previous_pyramid
+
+
 class StackedPyrHourGlass(nn.Module):
     def __init__(self,
                  nb_stacked,
@@ -103,7 +118,6 @@ class StackedPyrHourGlass(nn.Module):
         self.trained_depths = trained_depths
 
         # Build stacked pyramid models:
-        from copy import deepcopy
         pyramidNet_kwargs["in_channels"] = in_channels + pyramid_fmaps
         pyramidNet_kwargs["pyramid_fmaps"] = pyramid_fmaps
         self.pyr_kwargs = [deepcopy(pyramidNet_kwargs) for _ in range(nb_stacked)]
@@ -350,23 +364,24 @@ class FeaturePyramidUNet3D(EncoderDecoderSkeleton):
         self.fix_batchnorm_problem()
 
     def fix_batchnorm_problem(self):
+        # TODO: initialize residual blocks in the smart way?
         for m in self.modules():
             if isinstance(m, (nn.BatchNorm3d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def build_shortcut_conv(self, depth):
-        # build final bottom-up shortcut:
-        from inferno.extensions.layers import ConvActivation
-        from inferno.extensions.initializers.presets import OrthogonalWeightsZeroBias
-        return ConvActivation(self.pyramid_fmaps, self.pyramid_fmaps, (1,3,3), dim=3,
-                       stride=self.scale_factors[depth],
-                       dilation=(1,3,3),
-                       activation='ELU',
-                       initialization=OrthogonalWeightsZeroBias())
-
-    def build_shortcut_merge(self, depth):
-        return Sum()
+    # def build_shortcut_conv(self, depth):
+    #     # build final bottom-up shortcut:
+    #     from inferno.extensions.layers import ConvActivation
+    #     from inferno.extensions.initializers.presets import OrthogonalWeightsZeroBias
+    #     return ConvActivation(self.pyramid_fmaps, self.pyramid_fmaps, (1,3,3), dim=3,
+    #                    stride=self.scale_factors[depth],
+    #                    dilation=(1,3,3),
+    #                    activation='ELU',
+    #                    initialization=OrthogonalWeightsZeroBias())
+    #
+    # def build_shortcut_merge(self, depth):
+    #     return Sum()
 
     def forward(self, *inputs):
         input, offsets = inputs
@@ -599,6 +614,191 @@ class NewFeaturePyramidUNet3D(FeaturePyramidUNet3D):
                                  normalization="GroupNorm",
                                  num_groups_norm=16,  # TODO: generalize
                                  )
+
+
+class YetAnotherFeaturePyramidUNet3D(FeaturePyramidUNet3D):
+    def __init__(self, depth, in_channels, encoder_fmaps, pyramid_fmaps,
+                 scale_factor=2,
+                 conv_type='vanilla',
+                 final_activation=None,
+                 upsampling_mode='nearest',
+                 patchNet_kwargs=None,
+                 scale_spec_patchNet_kwargs=None,
+                 output_fmaps=None,
+                 stop_decoder_at_depth=0, # Sometimes we stop the decoder earlier
+                 nb_patch_nets=2,
+                 **kwargs):
+        # TODO: improve this crap
+        self.depth = depth
+        self.in_channels = in_channels
+        self.pyramid_fmaps = pyramid_fmaps
+        self.output_fmaps = pyramid_fmaps if output_fmaps is None else output_fmaps
+        self.stop_decoder_at_depth = stop_decoder_at_depth
+
+
+        if isinstance(encoder_fmaps, (list, tuple)):
+            self.encoder_fmaps = encoder_fmaps
+        else:
+            assert isinstance(encoder_fmaps, int)
+            if 'fmap_increase' in kwargs:
+                self.fmap_increase = kwargs['fmap_increase']
+                self.encoder_fmaps = [encoder_fmaps + i * self.fmap_increase for i in range(self.depth + 1)]
+            elif 'fmap_factor' in kwargs:
+                self.fmap_factor = kwargs['fmap_factor']
+                self.encoder_fmaps = [encoder_fmaps * self.fmap_factor ** i for i in range(self.depth + 1)]
+            else:
+                self.encoder_fmaps = [encoder_fmaps, ] * (self.depth + 1)
+
+        self.final_activation = [final_activation] if final_activation is not None else None
+
+        # parse conv_type
+        if isinstance(conv_type, str):
+            assert conv_type in CONV_TYPES
+            self.conv_type = CONV_TYPES[conv_type]
+        else:
+            assert isinstance(conv_type, type)
+            self.conv_type = conv_type
+
+        # parse scale factor
+        if isinstance(scale_factor, int):
+            scale_factor = [scale_factor, ] * depth
+        scale_factors = scale_factor
+        normalized_factors = []
+        for scale_factor in scale_factors:
+            assert isinstance(scale_factor, (int, list, tuple))
+            if isinstance(scale_factor, int):
+                scale_factor = self.dim * [scale_factor, ]
+            assert len(scale_factor) == self.dim
+            normalized_factors.append(scale_factor)
+        self.scale_factors = normalized_factors
+        self.upsampling_mode = upsampling_mode
+
+        # compute input size divisibiliy constraints
+        divisibility_constraint = np.ones(len(self.scale_factors[0]))
+        for scale_factor in self.scale_factors:
+            divisibility_constraint *= np.array(scale_factor)
+        self.divisibility_constraint = list(divisibility_constraint.astype(int))
+
+        super(FeaturePyramidUNet3D, self).__init__(depth)
+
+        # Build patchNets:
+        # patchNet_kwargs["latent_variable_size"] = pyramid_fmaps
+        self.ptch_kwargs = [deepcopy(patchNet_kwargs) for _ in range(nb_patch_nets)]
+        # self.scale_spec_patchNet_kwargs = scale_spec_patchNet_kwargs
+        if scale_spec_patchNet_kwargs is not None:
+            assert len(scale_spec_patchNet_kwargs) == nb_patch_nets
+            for i in range(nb_patch_nets):
+                self.ptch_kwargs[i]["output_shape"] = scale_spec_patchNet_kwargs[i]["patch_size"]
+                # self.ptch_kwargs[i].update(scale_spec_patchNet_kwargs[i])
+        self.patch_models = nn.ModuleList([
+            PatchNet(**kwgs) for kwgs in self.ptch_kwargs
+        ])
+
+        # Build embedding heads:
+        emb_heads = {}
+        for i in range(nb_patch_nets):
+            depth_patch_net = scale_spec_patchNet_kwargs[i].get("depth_level", 0)
+            emb_heads[depth_patch_net] = [] if depth_patch_net not in emb_heads else emb_heads[depth_patch_net]
+            emb_heads[depth_patch_net].append(self.construct_embedding_heads(scale_spec_patchNet_kwargs[i].get("depth_level", 0)))
+
+        self.emb_heads = nn.ModuleDict(
+            {str(dpth): nn.ModuleList(emb_heads[dpth]) for dpth in emb_heads}
+           )
+
+    def forward(self, input):
+        encoded_states = []
+        current = input
+        for encode, downsample in zip(self.encoder_modules, self.downsampling_modules):
+            current = encode(current)
+            encoded_states.append(current)
+            current = downsample(current)
+        current = self.base_module(current)
+
+        emb_outputs = []
+        for encoded_state, upsample, skip, merge, decode, depth in reversed(list(zip(
+                encoded_states, self.upsampling_modules, self.skip_modules, self.merge_modules, self.decoder_modules, range(len(self.decoder_modules))))):
+            if depth < self.stop_decoder_at_depth:
+                break
+            current = upsample(current)
+            current = merge(current, encoded_state)
+            current = decode(current)
+
+            # Attach possible emb. heads:
+            if str(depth) in self.emb_heads:
+                for emb_head in self.emb_heads[str(depth)]:
+                    emb_out = emb_head(current)
+                    emb_outputs.append(emb_out)
+
+
+        emb_outputs.reverse()
+
+        return emb_outputs
+
+
+    def construct_embedding_heads(self, depth):
+        assert depth >= self.stop_decoder_at_depth
+        return ConvNormActivation(self.pyramid_fmaps, self.output_fmaps, kernel_size=(1, 1, 1),
+                                  dim=3,
+                                  activation=None,
+                                  normalization=None)
+
+    def construct_merge_module(self, depth):
+        if depth >= self.stop_decoder_at_depth:
+            return MergePyramidNew(self.pyramid_fmaps, self.encoder_fmaps[depth])
+        else:
+            return None
+
+
+    def construct_encoder_module(self, depth):
+        f_in = self.encoder_fmaps[depth - 1] if depth != 0 else self.in_channels
+        f_out = self.encoder_fmaps[depth]
+        if depth != 0:
+            return nn.Sequential(
+                ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 ),
+                ResBlockAdvanced(f_out, f_inner=f_out, pre_kernel_size=(3, 3, 3),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 ),
+            )
+        if depth == 0:
+            return ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 5, 5),
+                                 inner_kernel_size=(1, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 )
+
+    def construct_decoder_module(self, depth):
+        if depth >= self.stop_decoder_at_depth:
+            # Let's try with a super-simple conv:
+            return ConvNormActivation(self.pyramid_fmaps, self.pyramid_fmaps, kernel_size=(1, 3, 3),
+                                            dim=3,
+                                            activation="ReLU",
+                                            num_groups_norm=16,
+                                            normalization="GroupNorm")
+        else:
+            return None
+
+    def construct_base_module(self):
+        f_in = self.encoder_fmaps[self.depth - 1]
+        f_intermediate = self.encoder_fmaps[self.depth]
+        f_out = self.pyramid_fmaps
+        return ResBlockAdvanced(f_in, f_inner=f_intermediate,
+                                f_out=f_out,
+                                pre_kernel_size=(1, 3, 3),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,  # TODO: generalize
+                                 )
+
 
 class UNetSkeleton(EncoderDecoderSkeleton):
 
