@@ -695,15 +695,15 @@ class YetAnotherFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         ])
 
         # Build embedding heads:
-        emb_heads = {}
+        emb_slices = {}
         for i in range(nb_patch_nets):
             depth_patch_net = scale_spec_patchNet_kwargs[i].get("depth_level", 0)
-            emb_heads[depth_patch_net] = [] if depth_patch_net not in emb_heads else emb_heads[depth_patch_net]
-            emb_heads[depth_patch_net].append(self.construct_embedding_heads(scale_spec_patchNet_kwargs[i].get("depth_level", 0)))
+            emb_slices[depth_patch_net] = [] if depth_patch_net not in emb_slices else emb_slices[depth_patch_net]
+            nb_nets_at_depths = len(emb_slices[depth_patch_net])
+            new_slc = (slice(None), slice(nb_nets_at_depths*self.output_fmaps, (nb_nets_at_depths+1)*self.output_fmaps))
+            emb_slices[depth_patch_net].append((i, new_slc))
 
-        self.emb_heads = nn.ModuleDict(
-            {str(dpth): nn.ModuleList(emb_heads[dpth]) for dpth in emb_heads}
-           )
+        self.emb_slices =  emb_slices
 
     def forward(self, input):
         encoded_states = []
@@ -724,9 +724,9 @@ class YetAnotherFeaturePyramidUNet3D(FeaturePyramidUNet3D):
             current = decode(current)
 
             # Attach possible emb. heads:
-            if str(depth) in self.emb_heads:
-                for emb_head in self.emb_heads[str(depth)]:
-                    emb_out = emb_head(current)
+            if depth in self.emb_slices:
+                for emb_slc in self.emb_slices[depth]:
+                    emb_out = current[emb_slc[1]]
                     emb_outputs.append(emb_out)
 
 
