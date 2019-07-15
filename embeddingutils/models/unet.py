@@ -206,6 +206,58 @@ class CropVolumeModule(nn.Module):
         return tensor[crop_slc]
 
 
+class PatchNetVAE(nn.Module):
+    def __init__(self, patchNet_kwargs, pre_maxpool=None):
+        super(PatchNetVAE, self).__init__()
+        assert patchNet_kwargs['downscaling_factor'] == (1, 1, 1) or patchNet_kwargs['downscaling_factor'] == [1, 1, 1], "Not implemented atm"
+        self.patch_net = ptch = PatchNet(**patchNet_kwargs)
+
+        # Build the encoder:
+        self.encoder_module = ResBlockAdvanced(1, f_inner=ptch.feature_maps,
+                                               f_out=ptch.feature_maps,
+                                               dim=3,
+                                               pre_kernel_size=(1, 3, 3),
+                                               inner_kernel_size=(3, 3, 3),
+                                               activation="ReLU",
+                                               normalization="GroupNorm",
+                                               num_groups_norm=2,)
+        self.linear_encoder = nn.Linear(ptch.vectorized_shape * ptch.feature_maps, ptch.latent_variable_size * 2)
+
+        self.pre_maxpool = None
+        if pre_maxpool is not None:
+            self.pre_maxpool = nn.MaxPool3d(kernel_size=pre_maxpool,
+                                            stride=pre_maxpool,
+                                            padding=0)
+
+    def encoder(self, input):
+        N = input.shape[0]
+        encoded = self.encoder_module(input)
+        reshaped = encoded.view(N, -1)
+        vector = self.linear_encoder(reshaped)
+        latent_var_size = self.patch_net.latent_variable_size
+        return vector[:,:latent_var_size], vector[:,latent_var_size:]
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def generate(self, shape):
+        return torch.randn(shape)
+
+
+    def forward(self, input):
+        if self.pre_maxpool is not None:
+            input = self.pre_maxpool(input)
+
+        # encoded_variable = self.encode(input_)
+        mu, logvar = self.encoder(input)
+
+        z = self.reparameterize(mu, logvar)
+
+        reconstructed = self.patch_net(z)
+
+        return [reconstructed, mu, logvar]
 
 
 class PatchNet(nn.Module):
@@ -215,6 +267,10 @@ class PatchNet(nn.Module):
                  downscaling_factor=(1, 2, 2),
                  feature_maps=16):
         super(PatchNet, self).__init__()
+
+
+        assert downscaling_factor == (1,1,1) or downscaling_factor == [1,1,1], "Not implemented atm"
+
         output_shape = tuple(output_shape) if isinstance(output_shape, list) else output_shape
         downscaling_factor = tuple(downscaling_factor) if isinstance(downscaling_factor, list) else downscaling_factor
         assert isinstance(downscaling_factor, tuple)
@@ -228,11 +284,13 @@ class PatchNet(nn.Module):
         self.vectorized_shape = np.array(self.min_path_shape).prod()
 
         # Build layers:
+        self.latent_variable_size = latent_variable_size
         self.linear_base = nn.Linear(latent_variable_size, self.vectorized_shape * feature_maps)
 
         self.upsampling = Upsample(scale_factor=downscaling_factor, mode="nearest")
 
         assert feature_maps % 2 == 0, "Necessary for group norm"
+        self.feature_maps = feature_maps
         self.decoder_module = ResBlockAdvanced(feature_maps, f_inner=feature_maps,
                                                f_out=1,
                                                dim=3,
