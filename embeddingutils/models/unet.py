@@ -257,6 +257,14 @@ class PatchNetVAE(nn.Module):
 
         reconstructed = self.patch_net(z)
 
+        # Expand to avoid complains from firelight:
+        mu = mu.unsqueeze(-1)
+        mu = mu.unsqueeze(-1)
+        mu = mu.unsqueeze(-1)
+        logvar = logvar.unsqueeze(-1)
+        logvar = logvar.unsqueeze(-1)
+        logvar = logvar.unsqueeze(-1)
+
         return [reconstructed, mu, logvar]
 
 
