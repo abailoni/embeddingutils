@@ -101,6 +101,48 @@ class MergePyramidNew(nn.Module):
     def forward(self, previous_pyramid, backbone):
         return self.conv(backbone) + previous_pyramid
 
+class UpsampleAndCrop(nn.Module):
+    def __init__(self, scale_factor, mode,
+                                  crop_slice=None):
+        super(UpsampleAndCrop, self).__init__()
+        self.upsampler = Upsample(scale_factor=scale_factor, mode=mode)
+        self.crop_slice = crop_slice
+
+        if self.crop_slice is not None:
+            assert isinstance(self.crop_slice, str)
+            from inferno.io.volumetric.volumetric_utils import parse_data_slice
+            self.crop_slice = (slice(None), slice(None)) + parse_data_slice(self.crop_slice)
+
+    def forward(self, input):
+        output = self.upsampler(input)
+        if self.crop_slice is not None:
+            output = output[self.crop_slice]
+        return output
+
+class MergePyramidAndAutoCrop(nn.Module):
+    def __init__(self, pyramid_feat, backbone_feat):
+        super(MergePyramidAndAutoCrop, self).__init__()
+        self.conv = ConvNormActivation(backbone_feat, pyramid_feat, kernel_size=(1, 1, 1),
+                                  dim=3,
+                                       activation="ReLU",
+                                       normalization="GroupNorm",
+                                       num_groups_norm=16)
+
+
+    def forward(self, previous_pyramid, backbone):
+        if previous_pyramid.shape[2:] != backbone.shape[2:]:
+            target_shape = previous_pyramid.shape[2:]
+            orig_shape = backbone.shape[2:]
+            diff = [orig-trg for orig, trg in zip(orig_shape, target_shape)]
+            assert all([d>0 for d in diff]), "Target should be smaller than original tensor"
+            left_crops = [int(d/2) for d in diff]
+            right_crops = [shp-int(d/2) if d%2==0 else shp-(int(d/2)+1)  for d, shp in zip(diff, orig_shape)]
+            crop_slice = (slice(None), slice(None)) + tuple(slice(lft,rgt) for rgt,lft in zip(right_crops, left_crops))
+            backbone = backbone[crop_slice]
+
+        return self.conv(backbone) + previous_pyramid
+
+
 
 class StackedPyrHourGlass(nn.Module):
     def __init__(self,
@@ -470,34 +512,6 @@ class FeaturePyramidUNet3D(EncoderDecoderSkeleton):
             feature_pyramid.append(current)
 
         feature_pyramid.reverse()
-        # Bottom-up shortcut:
-        # feature_pyramid_upscaled = [current]
-        # for d, conv, merge  in zip(range(0, self.depth-1), self.shortcut_convs, self.shortcut_merge):
-        #     current = conv(current)
-        #     current = merge(current, feature_pyramid[d])
-        #     # feature_pyramid[d] = current
-        # #     # Upscale:
-        # #     if d == 1:
-        # #         feature_pyramid_upscaled.append(self.upsampling_modules[1](current))
-        # #     elif d == 2:
-        # #         feature_pyramid_upscaled.append(self.upsampling_modules[1](self.upsampling_modules[2](current)))
-        # #     else:
-        # #         raise NotImplementedError("Temp hack, only working with depth 3")
-        # for d in range(1, self.depth):
-        #     # Upscale:
-        #     if d == 1:
-        #         feature_pyramid_upscaled.append(self.upsampling_modules[1](feature_pyramid[d]))
-        #     elif d == 2:
-        #         feature_pyramid_upscaled.append(self.upsampling_modules[1](self.upsampling_modules[2](feature_pyramid[d])))
-        #     else:
-        #         raise NotImplementedError("Temp hack, only working with depth 3")
-
-
-
-        # # Perform final convolution:
-        # concatenated_features = torch.cat(tuple(feature_pyramid_upscaled)+(self.downsampling_modules[0](offsets.float()),), 1)
-        # affinities = self.sigmoid(self.final_conv(concatenated_features))
-        # return [affinities] + feature_pyramid
         return feature_pyramid
 
     def construct_merge_module(self, depth):
@@ -864,6 +878,199 @@ class YetAnotherFeaturePyramidUNet3D(FeaturePyramidUNet3D):
                                  normalization="GroupNorm",
                                  num_groups_norm=16,  # TODO: generalize
                                  )
+
+
+
+class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
+    def __init__(self, depth, in_channels, encoder_fmaps, pyramid_fmaps,
+                 res_blocks_3D,
+                 scale_factor=2,
+                 final_activation=None, # FIXME
+                 upsampling_mode='nearest',
+                 patchNet_kwargs=None,
+                 output_fmaps=None,
+                 decoder_crops=None,
+                 stop_decoder_at_depth=0, # Sometimes we stop the decoder earlier
+                 **kwargs):
+        # TODO: assert all this stuff
+        self.depth = depth
+        self.in_channels = in_channels
+        self.pyramid_fmaps = pyramid_fmaps
+        self.output_fmaps = pyramid_fmaps if output_fmaps is None else output_fmaps
+        self.stop_decoder_at_depth = stop_decoder_at_depth
+        self.res_blocks_3D = res_blocks_3D
+        self.decoder_crops = decoder_crops if decoder_crops is not None else {}
+        assert len(self.decoder_crops) <= 1, "For the moment maximum one crop is supported"
+
+
+        assert isinstance(encoder_fmaps, (list, tuple))
+        self.encoder_fmaps = encoder_fmaps
+
+        self.final_activation = [final_activation] if final_activation is not None else None
+
+
+        # Parse scale factor
+        if isinstance(scale_factor, int):
+            scale_factor = [scale_factor, ] * depth
+        scale_factors = scale_factor
+        normalized_factors = []
+        for scale_factor in scale_factors:
+            assert isinstance(scale_factor, (int, list, tuple))
+            if isinstance(scale_factor, int):
+                scale_factor = self.dim * [scale_factor, ]
+            assert len(scale_factor) == self.dim
+            normalized_factors.append(scale_factor)
+        self.scale_factors = normalized_factors
+        self.upsampling_mode = upsampling_mode
+
+        # TODO: compute input size divisibiliy constraints
+
+        super(FeaturePyramidUNet3D, self).__init__(depth)
+
+        # Build patchNets:
+        # patchNet_kwargs["latent_variable_size"] = pyramid_fmaps
+        global_kwargs = patchNet_kwargs.pop("global", {})
+        self.nb_patch_nets = nb_patch_nets = len(patchNet_kwargs.keys())
+        self.ptch_kwargs = [deepcopy(global_kwargs) for _ in range(nb_patch_nets)]
+        for i in range(nb_patch_nets):
+            self.ptch_kwargs[i]["output_shape"] = patchNet_kwargs[i]["patch_size"]
+        self.patch_models = nn.ModuleList([
+            PatchNet(**kwgs) for kwgs in self.ptch_kwargs
+        ])
+
+        # Build embedding heads:
+        emb_slices = {}
+        for i in range(nb_patch_nets):
+            depth_patch_net = patchNet_kwargs[i].get("depth_level", 0)
+            emb_slices[depth_patch_net] = [] if depth_patch_net not in emb_slices else emb_slices[depth_patch_net]
+            nb_nets_at_depths = len(emb_slices[depth_patch_net])
+            new_slc = (slice(None), slice(nb_nets_at_depths*self.output_fmaps, (nb_nets_at_depths+1)*self.output_fmaps))
+            emb_slices[depth_patch_net].append((i, new_slc))
+
+        self.emb_slices = emb_slices
+
+    def forward(self, input):
+        encoded_states = []
+        current = input
+        for encode, downsample in zip(self.encoder_modules, self.downsampling_modules):
+            current = encode(current)
+            encoded_states.append(current)
+            current = downsample(current)
+        current = self.base_module(current)
+
+        emb_outputs = []
+        for encoded_state, upsample, skip, merge, decode, depth in reversed(list(zip(
+                encoded_states, self.upsampling_modules, self.skip_modules, self.merge_modules, self.decoder_modules, range(len(self.decoder_modules))))):
+            if depth < self.stop_decoder_at_depth:
+                break
+            current = upsample(current)
+            current = merge(current, encoded_state)
+            current = decode(current)
+
+            # Attach possible emb. heads:
+            if depth in self.emb_slices:
+                for emb_slc in self.emb_slices[depth]:
+                    emb_out = current[emb_slc[1]]
+                    emb_outputs.append(emb_out)
+
+
+        emb_outputs.reverse()
+
+        return emb_outputs
+
+
+    def construct_embedding_heads(self, depth):
+        assert depth >= self.stop_decoder_at_depth
+        return ConvNormActivation(self.pyramid_fmaps, self.output_fmaps, kernel_size=(1, 1, 1),
+                                  dim=3,
+                                  activation=None,
+                                  normalization=None)
+
+    def construct_upsampling_module(self, depth):
+        scale_factor = self.scale_factors[depth]
+        if scale_factor[0] == 1:
+            assert scale_factor[1] == scale_factor[2]
+
+        sampler = UpsampleAndCrop(scale_factor=scale_factor, mode=self.upsampling_mode,
+                                  crop_slice=self.decoder_crops.get(depth))
+        return sampler
+
+
+    def construct_merge_module(self, depth):
+        if depth >= self.stop_decoder_at_depth:
+            return MergePyramidAndAutoCrop(self.pyramid_fmaps, self.encoder_fmaps[depth])
+        else:
+            return None
+
+    def concatenate_res_blocks(self, f_in, f_out, blocks_spec, depth):
+        """
+        Concatenate multiple residual blocks according to the config file
+        """
+        # TODO: generalize
+        assert f_out % 16 == 0, "Not divisible for group norm!"
+
+        blocks_list = []
+        if depth == 0:
+            assert all([not is_3D for is_3D in blocks_spec]), "All blocks at highest level should be 2D"
+            # Add by the default the first block:
+            blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 5, 5),
+                                 inner_kernel_size=(1, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,
+                                 ))
+            blocks_spec.pop(0)
+            f_in = f_out
+
+        # Concatenate possible additional blocks:
+        for is_3D in blocks_spec:
+            assert isinstance(is_3D, bool)
+            if is_3D:
+                blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                 inner_kernel_size=(3, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,
+                                 ))
+            else:
+                blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                 inner_kernel_size=(1, 3, 3),
+                                 activation="ReLU",
+                                 normalization="GroupNorm",
+                                 num_groups_norm=16,
+                                 ))
+            f_in = f_out
+
+        return nn.Sequential(*blocks_list)
+
+
+    def construct_encoder_module(self, depth):
+        f_in = self.encoder_fmaps[depth - 1] if depth != 0 else self.in_channels
+        f_out = self.encoder_fmaps[depth]
+
+        # Build blocks:
+        blocks_spec = deepcopy(self.res_blocks_3D[depth])
+        return self.concatenate_res_blocks(f_in, f_out, blocks_spec, depth)
+
+
+    def construct_decoder_module(self, depth):
+        if depth >= self.stop_decoder_at_depth:
+            # Let's try with a super-simple conv:
+            return ConvNormActivation(self.pyramid_fmaps, self.pyramid_fmaps, kernel_size=(1, 3, 3),
+                                            dim=3,
+                                            activation="ReLU",
+                                            num_groups_norm=16,
+                                            normalization="GroupNorm")
+        else:
+            return None
+
+    def construct_base_module(self):
+        f_in = self.encoder_fmaps[self.depth - 1]
+        # f_intermediate = self.encoder_fmaps[self.depth]
+        f_out = self.pyramid_fmaps
+        blocks_spec = deepcopy(self.res_blocks_3D[self.depth])
+        return self.concatenate_res_blocks(f_in, f_out, blocks_spec, self.depth)
+
 
 
 class UNetSkeleton(EncoderDecoderSkeleton):
