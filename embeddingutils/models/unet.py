@@ -1171,7 +1171,7 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
         # Build crop-modules:
         from vaeAffs.transforms import DownsampleAndCrop3D
         self.downscale_and_crop = downscale_and_crop if downscale_and_crop is not None else {}
-        self.crop_transforms = {mdl: DownsampleAndCrop3D(**downscale_and_crop[mdl]) for mdl in downscale_and_crop}
+        self.crop_transforms = {mdl: DownsampleAndCrop3D(**self.downscale_and_crop[mdl]) for mdl in self.downscale_and_crop}
 
         # TODO: not sure it changes anything...
         self.fix_batchnorm_problem()
@@ -1209,7 +1209,8 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
             # Get the first output and prepare it to be inputed to the next model:
             # (avoid backprop between models atm)
             last_output = current_outputs[0].detach()
-            last_output = self.crop_transforms[mdl].apply_to_torch_tensor(last_output)
+            if mdl in self.crop_transforms:
+                last_output = self.crop_transforms[mdl].apply_to_torch_tensor(last_output)
 
         return output_features
 
