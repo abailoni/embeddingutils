@@ -134,7 +134,7 @@ class MergePyramidAndAutoCrop(nn.Module):
             target_shape = previous_pyramid.shape[2:]
             orig_shape = backbone.shape[2:]
             diff = [orig-trg for orig, trg in zip(orig_shape, target_shape)]
-            assert all([d>0 for d in diff]), "Target should be smaller than original tensor"
+            assert all([d>=0 for d in diff]), "Target should be smaller than original tensor"
             left_crops = [int(d/2) for d in diff]
             right_crops = [shp-int(d/2) if d%2==0 else shp-(int(d/2)+1)  for d, shp in zip(diff, orig_shape)]
             crop_slice = (slice(None), slice(None)) + tuple(slice(lft,rgt) for rgt,lft in zip(right_crops, left_crops))
@@ -315,9 +315,13 @@ class PatchNet(nn.Module):
                  latent_variable_size=128,
                  output_shape=(5, 29, 29),
                  downscaling_factor=(1, 2, 2),
-                 feature_maps=16):
+                 feature_maps=16,
+                 **extra_kwargs):
         super(PatchNet, self).__init__()
 
+        # FIXME: ugly hack
+        ptch_size = extra_kwargs.get("patch_size")
+        output_shape = ptch_size if ptch_size is not None else output_shape
 
         assert downscaling_factor == (1,1,1) or downscaling_factor == [1,1,1], "Not implemented atm"
 
@@ -891,6 +895,8 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
                  output_fmaps=None,
                  decoder_crops=None,
                  stop_decoder_at_depth=0, # Sometimes we stop the decoder earlier
+                 previous_output_from_stacked_models=False,
+                 add_embedding_heads=False,
                  **kwargs):
         # TODO: assert all this stuff
         self.depth = depth
@@ -899,6 +905,8 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         self.output_fmaps = pyramid_fmaps if output_fmaps is None else output_fmaps
         self.stop_decoder_at_depth = stop_decoder_at_depth
         self.res_blocks_3D = res_blocks_3D
+        assert isinstance(previous_output_from_stacked_models, bool)
+        self.previous_output_from_stacked_models = previous_output_from_stacked_models
         self.decoder_crops = decoder_crops if decoder_crops is not None else {}
         assert len(self.decoder_crops) <= 1, "For the moment maximum one crop is supported"
 
@@ -933,26 +941,58 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         self.nb_patch_nets = nb_patch_nets = len(patchNet_kwargs.keys())
         self.ptch_kwargs = [deepcopy(global_kwargs) for _ in range(nb_patch_nets)]
         for i in range(nb_patch_nets):
-            self.ptch_kwargs[i]["output_shape"] = patchNet_kwargs[i]["patch_size"]
+            self.ptch_kwargs[i].update(patchNet_kwargs[i])
         self.patch_models = nn.ModuleList([
             PatchNet(**kwgs) for kwgs in self.ptch_kwargs
         ])
 
         # Build embedding heads:
-        emb_slices = {}
-        for i in range(nb_patch_nets):
-            depth_patch_net = patchNet_kwargs[i].get("depth_level", 0)
-            emb_slices[depth_patch_net] = [] if depth_patch_net not in emb_slices else emb_slices[depth_patch_net]
-            nb_nets_at_depths = len(emb_slices[depth_patch_net])
-            new_slc = (slice(None), slice(nb_nets_at_depths*self.output_fmaps, (nb_nets_at_depths+1)*self.output_fmaps))
-            emb_slices[depth_patch_net].append((i, new_slc))
+        self.add_embedding_heads =  add_embedding_heads
+        if add_embedding_heads:
+            emb_heads = {}
+            for i in range(nb_patch_nets):
+                depth_patch_net = patchNet_kwargs[i].get("depth_level", 0)
+                emb_heads[depth_patch_net] = [] if depth_patch_net not in emb_heads else emb_heads[depth_patch_net]
+                emb_heads[depth_patch_net].append(
+                    self.construct_embedding_heads(depth_patch_net))
 
-        self.emb_slices = emb_slices
+            self.emb_heads = nn.ModuleDict(
+                {str(dpth): nn.ModuleList(emb_heads[dpth]) for dpth in emb_heads}
+            )
+        else:
+            emb_slices = {}
+            for i in range(nb_patch_nets):
+                depth_patch_net = patchNet_kwargs[i].get("depth_level", 0)
+                emb_slices[depth_patch_net] = [] if depth_patch_net not in emb_slices else emb_slices[depth_patch_net]
+                nb_nets_at_depths = len(emb_slices[depth_patch_net])
+                new_slc = (slice(None), slice(nb_nets_at_depths*self.output_fmaps, (nb_nets_at_depths+1)*self.output_fmaps))
+                emb_slices[depth_patch_net].append((i, new_slc))
 
-    def forward(self, input):
+            self.emb_slices = emb_slices
+
+    def construct_embedding_heads(self, depth):
+        assert depth >= self.stop_decoder_at_depth
+        return ConvNormActivation(self.pyramid_fmaps, self.output_fmaps, kernel_size=(1, 1, 1),
+                                  dim=3,
+                                  activation=None,
+                                  normalization=None)
+
+
+    def forward(self, *inputs):
+        # Modification for stacked architectures:
+        # (previous output is inserted at depth 1)
+        nb_inputs = len(inputs)
+        assert nb_inputs <= 2
+        input = inputs[0]
+        previous_output = inputs[1] if nb_inputs == 2 else None
+
         encoded_states = []
         current = input
-        for encode, downsample in zip(self.encoder_modules, self.downsampling_modules):
+        for encode, downsample, depth in zip(self.encoder_modules, self.downsampling_modules,
+                                      range(self.depth)):
+            if depth == 1 and previous_output is not None:
+                assert self.previous_output_from_stacked_models
+                current = torch.cat((previous_output, current), dim=1)
             current = encode(current)
             encoded_states.append(current)
             current = downsample(current)
@@ -967,12 +1007,16 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
             current = merge(current, encoded_state)
             current = decode(current)
 
-            # Attach possible emb. heads:
-            if depth in self.emb_slices:
-                for emb_slc in self.emb_slices[depth]:
-                    emb_out = current[emb_slc[1]]
-                    emb_outputs.append(emb_out)
-
+            if self.add_embedding_heads:
+                if str(depth) in self.emb_heads:
+                    for emb_head in self.emb_heads[str(depth)]:
+                        emb_out = emb_head(current)
+                        emb_outputs.append(emb_out)
+            else:
+                if depth in self.emb_slices:
+                    for emb_slc in self.emb_slices[depth]:
+                        emb_out = current[emb_slc[1]]
+                        emb_outputs.append(emb_out)
 
         emb_outputs.reverse()
 
@@ -1048,6 +1092,11 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         f_in = self.encoder_fmaps[depth - 1] if depth != 0 else self.in_channels
         f_out = self.encoder_fmaps[depth]
 
+        # Increase input channels if we expect outputs from previous stacked models:
+        if depth == 1 and self.previous_output_from_stacked_models:
+            f_in = self.pyramid_fmaps + self.encoder_fmaps[0]
+            assert f_in <= f_out, "Bottleneck! Output channels are less the input ones"
+
         # Build blocks:
         blocks_spec = deepcopy(self.res_blocks_3D[depth])
         return self.concatenate_res_blocks(f_in, f_out, blocks_spec, depth)
@@ -1071,6 +1120,98 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         blocks_spec = deepcopy(self.res_blocks_3D[self.depth])
         return self.concatenate_res_blocks(f_in, f_out, blocks_spec, self.depth)
 
+
+class GeneralizedStackedPyramidUNet3D(nn.Module):
+    def __init__(self,
+                 nb_stacked,
+                 models_kwargs,
+                 models_to_train,
+                 downscale_and_crop=None
+                 ):
+        super(GeneralizedStackedPyramidUNet3D, self).__init__()
+        assert isinstance(nb_stacked, int)
+        self.nb_stacked = nb_stacked
+
+        # Collect models kwargs:
+        global_kwargs = models_kwargs.pop("global", {})
+        self.models_kwargs = [deepcopy(global_kwargs) for _ in range(nb_stacked)]
+        for mdl in range(nb_stacked):
+            if mdl in models_kwargs:
+                self.models_kwargs[mdl].update(models_kwargs[mdl])
+            # All models should expect a previous input, apart from the first one:
+            if mdl > 0:
+                self.models_kwargs[mdl]["previous_output_from_stacked_models"] = True
+
+        # Build models (now PatchNets are also automatically built here):
+        self.models = nn.ModuleList([
+            GeneralizedFeaturePyramidUNet3D(**kwargs) for kwargs in self.models_kwargs
+        ])
+
+        # Collect patchNet kwargs:
+        assert isinstance(models_to_train, list)
+        assert all(mdl < nb_stacked for mdl in models_to_train)
+        self.models_to_train = models_to_train
+        self.last_model_to_train = np.array(models_to_train).max()
+        collected_patchNet_kwargs = []
+        trained_patchNets = []
+        j = 0
+        for mdl in range(nb_stacked):
+            all_patchNet_kwargs = self.models[mdl].ptch_kwargs
+            for nb_ptchNet, patchNet_kwargs in enumerate(all_patchNet_kwargs):
+                if mdl in models_to_train:
+                    trained_patchNets.append(j)
+                current_kwargs = deepcopy(patchNet_kwargs)
+                current_kwargs["model_number"] = mdl
+                current_kwargs["patchNet_number"] = nb_ptchNet
+                collected_patchNet_kwargs.append(current_kwargs)
+                j += 1
+        self.collected_patchNet_kwargs = collected_patchNet_kwargs
+        self.trained_patchNets = trained_patchNets
+
+        # Build crop-modules:
+        from vaeAffs.transforms import DownsampleAndCrop3D
+        self.downscale_and_crop = downscale_and_crop if downscale_and_crop is not None else {}
+        self.crop_transforms = {mdl: DownsampleAndCrop3D(**downscale_and_crop[mdl]) for mdl in downscale_and_crop}
+
+        # TODO: not sure it changes anything...
+        self.fix_batchnorm_problem()
+
+    def fix_batchnorm_problem(self):
+        for m in self.modules():
+            if isinstance(m, (nn.BatchNorm3d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, *inputs):
+        assert len(inputs) == self.nb_stacked
+
+        # Apply stacked models:
+        last_output = None
+        output_features = []
+        for mdl in range(self.nb_stacked):
+            import contextlib
+            # Run in inference mode if we do not need to train patches of this model:
+            no_grad = torch.no_grad if mdl not in self.models_to_train else contextlib.nullcontext
+            with no_grad():
+                if mdl == 0:
+                    current_outputs = self.models[mdl](inputs[mdl])
+                else:
+                    # Pass previous output:
+                    current_outputs = self.models[mdl](inputs[mdl], last_output)
+
+            if mdl in self.models_to_train:
+                output_features += current_outputs
+
+            # Check if we should stop because next models are not trained:
+            if mdl+1 > self.last_model_to_train:
+                break
+
+            # Get the first output and prepare it to be inputed to the next model:
+            # (avoid backprop between models atm)
+            last_output = current_outputs[0].detach()
+            last_output = self.crop_transforms[mdl].apply_to_torch_tensor(last_output)
+
+        return output_features
 
 
 class UNetSkeleton(EncoderDecoderSkeleton):
