@@ -1023,12 +1023,6 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         return emb_outputs
 
 
-    def construct_embedding_heads(self, depth):
-        assert depth >= self.stop_decoder_at_depth
-        return ConvNormActivation(self.pyramid_fmaps, self.output_fmaps, kernel_size=(1, 1, 1),
-                                  dim=3,
-                                  activation=None,
-                                  normalization=None)
 
     def construct_upsampling_module(self, depth):
         scale_factor = self.scale_factors[depth]
@@ -1138,9 +1132,9 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
         for mdl in range(nb_stacked):
             if mdl in models_kwargs:
                 self.models_kwargs[mdl].update(models_kwargs[mdl])
-            # All models should expect a previous input, apart from the first one:
-            if mdl > 0:
-                self.models_kwargs[mdl]["previous_output_from_stacked_models"] = True
+            # # All models should expect a previous input, apart from the first one:
+            # if mdl > 0:
+            #     self.models_kwargs[mdl]["previous_output_from_stacked_models"] = True
 
         # Build models (now PatchNets are also automatically built here):
         self.models = nn.ModuleList([
@@ -1168,10 +1162,23 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
         self.collected_patchNet_kwargs = collected_patchNet_kwargs
         self.trained_patchNets = trained_patchNets
 
+        # Freeze-parameters for models that are not trained:
+        for mdl in range(nb_stacked):
+            if mdl not in self.models_to_train:
+                for param in self.models[mdl].parameters():
+                    param.requires_grad = False
+
         # Build crop-modules:
         from vaeAffs.transforms import DownsampleAndCrop3D
         self.downscale_and_crop = downscale_and_crop if downscale_and_crop is not None else {}
         self.crop_transforms = {mdl: DownsampleAndCrop3D(**self.downscale_and_crop[mdl]) for mdl in self.downscale_and_crop}
+
+
+        self.upsample_modules = nn.ModuleList([
+            Upsample(scale_factor=tuple(scl_fact), mode="nearest") for scl_fact in [[1,3,3]]
+        ])
+
+
 
         # TODO: not sure it changes anything...
         self.fix_batchnorm_problem()
@@ -1197,7 +1204,15 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                     current_outputs = self.models[mdl](inputs[mdl])
                 else:
                     # Pass previous output:
-                    current_outputs = self.models[mdl](inputs[mdl], last_output)
+                    # choice = np.random.randint(8)
+                    # if choice == 0:
+                    #     current_outputs = self.models[mdl](torch.zeros_like(inputs[mdl]), last_output)
+                    # elif choice == 1:
+                    #     current_outputs = self.models[mdl](inputs[mdl], torch.zeros_like(last_output))
+                    # else:
+                    # current_outputs = self.models[mdl](inputs[mdl], last_output)
+                    current_outputs = self.models[mdl](torch.cat((inputs[mdl], last_output), dim=1))
+
 
             if mdl in self.models_to_train:
                 output_features += current_outputs
@@ -1211,6 +1226,13 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
             last_output = current_outputs[0].detach()
             if mdl in self.crop_transforms:
                 last_output = self.crop_transforms[mdl].apply_to_torch_tensor(last_output)
+                last_output = self.upsample_modules[mdl](last_output)
+                from speedrun.log_anywhere import log_image, log_embedding, log_scalar
+                # print(last_output.device)
+                if last_output.device == torch.device('cuda:0'):
+                    log_image("prev_output", last_output)
+
+
 
         return output_features
 
