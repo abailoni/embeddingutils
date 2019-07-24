@@ -1237,6 +1237,63 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
         return output_features
 
 
+class IntersectOverUnionUNet(GeneralizedStackedPyramidUNet3D):
+    def __init__(self, *super_args, **super_kwargs):
+        super(IntersectOverUnionUNet, self).__init__(*super_args, **super_kwargs)
+
+        # Freeze-parameters of the pretrained model:
+        for mdl in range(self.nb_stacked):
+            for param in self.models[mdl].parameters():
+                param.requires_grad = False
+
+        # Build extra module:
+        self.embedding_dimension = self.models[0].output_fmaps
+        self.IoU_module = IntersectOverUnionModule(embedding_dimension=self.embedding_dimension)
+
+    def forward(self, *inputs):
+        with torch.no_grad():
+            outputs = super(IntersectOverUnionUNet, self).forward(*inputs)
+        return outputs
+
+class IntersectOverUnionModule(nn.Module):
+    def __init__(self, embedding_dimension=128):
+        super(IntersectOverUnionModule, self).__init__()
+        self.embedding_dimension = embedding_dimension
+        # Build some 1D convolutions:
+        # TODO: find a better solution and avoid padding with kernel 3...
+        self.block1 = nn.Sequential(
+            self.build_normalized_conv(embedding_dimension, embedding_dimension, (3, )),
+             self.build_normalized_conv(embedding_dimension, embedding_dimension, (3, )))
+        self.max_pool = nn.MaxPool1d(kernel_size=(2,), stride=(2,))
+        self.block2 = nn.Sequential(
+             self.build_normalized_conv(embedding_dimension, int(embedding_dimension/2), (1,)),
+             self.build_normalized_conv(int(embedding_dimension/2), int(embedding_dimension/4), (1,)),
+             self.build_normalized_conv(int(embedding_dimension/4), int(embedding_dimension/8), (1,)),
+        )
+        self.final_conv = ConvNormActivation(in_channels=int(embedding_dimension/8), out_channels=1,
+                           kernel_size=(1,), dim=1, activation="Sigmoid")
+        self.final_conv_2 = ConvNormActivation(in_channels=int(embedding_dimension), out_channels=1,
+                                             kernel_size=(1,), dim=1, activation="Sigmoid")
+
+
+    def build_normalized_conv(self, in_ch, out_ch, kernel_size):
+        return ConvNormActivation(in_channels=in_ch, out_channels=out_ch,
+                           kernel_size=kernel_size, dim=1, activation="ReLU",
+                                            num_groups_norm=16,
+                                            normalization="GroupNorm")
+
+    def forward(self, embeddings_1, embeddings_2):
+        # current = torch.cat((embeddings_1, embeddings_2), dim=2)
+        # current = self.block1(current)
+        # current = self.max_pool(current)
+        # current = self.block2(current)
+        # return self.final_conv(current)
+
+        # current = torch.cat((embeddings_1, embeddings_2), dim=1)
+        return self.final_conv_2(embeddings_1)
+
+
+
 class UNetSkeleton(EncoderDecoderSkeleton):
 
     def __init__(self, depth, in_channels, out_channels, fmaps, **kwargs):
