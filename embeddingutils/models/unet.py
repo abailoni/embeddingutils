@@ -1576,6 +1576,34 @@ class StackedAffinityNet(nn.Module):
         output = self.final_module(torch.cat(tuple(upscaled_feat_pyr[:3]), dim=1))
         return self.sigmoid(output)
 
+
+class GeneralizedAffinitiesFromEmb(nn.Module):
+    def __init__(self, path_model, nb_offsets):
+        super(GeneralizedAffinitiesFromEmb, self).__init__()
+
+        self.stacked_model = torch.load(path_model)["_model"]
+
+        # Freeze-parameters for models that are not trained:
+        for param in self.stacked_model.parameters():
+            param.requires_grad = False
+
+        output_maps = self.stacked_model.models[-1].output_fmaps
+
+        self.final_module = nn.Sequential(
+            Conv3D(in_channels=output_maps, out_channels=nb_offsets,
+                   kernel_size=(1, 5, 5))
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, *inputs):
+        with torch.no_grad():
+            current = self.stacked_model(*inputs)
+        assert len(current) == 1
+        current = self.final_module(current[0])
+        return self.sigmoid(current)
+
+
 class MaskUNet(UNet3D):
     def __init__(self, path_PyrUNet, *super_args, **super_kwargs):
         pyr_unet_model = torch.load(path_PyrUNet)["_model"]
