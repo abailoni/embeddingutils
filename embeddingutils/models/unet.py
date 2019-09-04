@@ -143,6 +143,25 @@ class MergePyramidAndAutoCrop(nn.Module):
         return self.conv(backbone) + previous_pyramid
 
 
+def auto_crop_tensor_to_shape(to_be_cropped, target_tensor_shape, return_slice=False,
+                              ignore_channel_and_batch_dims=True):
+    initial_shape = to_be_cropped.shape
+    diff = [int_sh - trg_sh for int_sh, trg_sh in zip(initial_shape, target_tensor_shape)]
+    if ignore_channel_and_batch_dims:
+        assert all([d >= 0 for d in diff[2:]]), "Target shape should be smaller!"
+    else:
+        assert all([d >= 0 for d in diff]), "Target shape should be smaller!"
+    left_crops = [int(d / 2) for d in diff]
+    right_crops = [shp - int(d / 2) if d % 2 == 0 else shp - (int(d / 2) + 1) for d, shp in zip(diff, initial_shape)]
+    if ignore_channel_and_batch_dims:
+        crop_slice = (slice(None), slice(None)) + tuple(slice(lft, rgt) for rgt, lft in zip(right_crops[2:], left_crops[2:]))
+    else:
+        crop_slice = tuple(slice(lft, rgt) for rgt, lft in zip(right_crops, left_crops))
+    if return_slice:
+        return crop_slice
+    else:
+        return to_be_cropped[crop_slice]
+
 
 class StackedPyrHourGlass(nn.Module):
     def __init__(self,
@@ -1171,9 +1190,11 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
         # Build crop-modules:
         from vaeAffs.transforms import DownsampleAndCrop3D
         self.downscale_and_crop = downscale_and_crop if downscale_and_crop is not None else {}
+        # TODO: deprecated (now an auto-crop is used)
         self.crop_transforms = {mdl: DownsampleAndCrop3D(**self.downscale_and_crop[mdl]) for mdl in self.downscale_and_crop}
 
 
+        # FIXME: generalize
         self.upsample_modules = nn.ModuleList([
             Upsample(scale_factor=tuple(scl_fact), mode="nearest") for scl_fact in [[1,3,3]]
         ])
@@ -1225,7 +1246,11 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
             # (avoid backprop between models atm)
             last_output = current_outputs[0].detach()
             if mdl in self.crop_transforms:
-                last_output = self.crop_transforms[mdl].apply_to_torch_tensor(last_output)
+                crp_shp = inputs[mdl+1].shape
+                # FIXME: generalize
+                crp_shp = crp_shp[:3] + (int(crp_shp[3]/3), int(crp_shp[4]/3))
+                last_output = auto_crop_tensor_to_shape(last_output, crp_shp)
+                # last_output = self.crop_transforms[mdl].apply_to_torch_tensor(last_output)
                 last_output = self.upsample_modules[mdl](last_output)
                 from speedrun.log_anywhere import log_image, log_embedding, log_scalar
                 # print(last_output.device)
