@@ -380,12 +380,7 @@ class PatchNet(nn.Module):
         self.final_activation = nn.Sigmoid()
 
     def forward(self, encoded_variable):
-        print("Linear check: ", encoded_variable.shape, self.latent_variable_size)
-        print(encoded_variable.device, )
-        for param in self.linear_base.parameters():
-            print(param.device)
         x = self.linear_base(encoded_variable)
-        print("Done0")
         N = x.shape[0]
         reshaped = x.view(N, -1, *self.min_path_shape)
 
@@ -407,10 +402,7 @@ class PatchNet(nn.Module):
         #     upsampled = nn.functional.pad(upsampled, padding[0]+padding[1]+padding[2], mode='replicate')
 
         out = self.decoder_module(upsampled)
-        print("Done2")
         out = self.final_activation(out)
-        print("Done3")
-
         return out
 
 
