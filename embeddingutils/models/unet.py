@@ -122,7 +122,10 @@ class UpsampleAndCrop(nn.Module):
 class MergePyramidAndAutoCrop(nn.Module):
     def __init__(self, pyramid_feat, backbone_feat):
         super(MergePyramidAndAutoCrop, self).__init__()
-        self.conv = ConvNormActivation(backbone_feat, pyramid_feat, kernel_size=(1, 1, 1),
+        if pyramid_feat == backbone_feat:
+            self.conv = Identity()
+        else:
+            self.conv = ConvNormActivation(backbone_feat, pyramid_feat, kernel_size=(1, 1, 1),
                                   dim=3,
                                        activation="ReLU",
                                        normalization="GroupNorm",
@@ -377,7 +380,12 @@ class PatchNet(nn.Module):
         self.final_activation = nn.Sigmoid()
 
     def forward(self, encoded_variable):
+        print("Linear check: ", encoded_variable.shape, self.latent_variable_size)
+        print(encoded_variable.device, )
+        for param in self.linear_base.parameters():
+            print(param.device)
         x = self.linear_base(encoded_variable)
+        print("Done0")
         N = x.shape[0]
         reshaped = x.view(N, -1, *self.min_path_shape)
 
@@ -398,9 +406,12 @@ class PatchNet(nn.Module):
         #     padding = [tuple(pad) for pad in padding]
         #     upsampled = nn.functional.pad(upsampled, padding[0]+padding[1]+padding[2], mode='replicate')
 
-        conved = self.decoder_module(upsampled)
+        out = self.decoder_module(upsampled)
+        print("Done2")
+        out = self.final_activation(out)
+        print("Done3")
 
-        return self.final_activation(conved)
+        return out
 
 
 
@@ -927,7 +938,7 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         assert isinstance(previous_output_from_stacked_models, bool)
         self.previous_output_from_stacked_models = previous_output_from_stacked_models
         self.decoder_crops = decoder_crops if decoder_crops is not None else {}
-        assert len(self.decoder_crops) <= 1, "For the moment maximum one crop is supported"
+        # assert len(self.decoder_crops) <= 1, "For the moment maximum one crop is supported"
 
 
         assert isinstance(encoder_fmaps, (list, tuple))
@@ -966,7 +977,7 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         ])
 
         # Build embedding heads:
-        self.add_embedding_heads =  add_embedding_heads
+        self.add_embedding_heads = add_embedding_heads
         if add_embedding_heads:
             emb_heads = {}
             for i in range(nb_patch_nets):
@@ -983,14 +994,18 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
             for i in range(nb_patch_nets):
                 depth_patch_net = patchNet_kwargs[i].get("depth_level", 0)
                 emb_slices[depth_patch_net] = [] if depth_patch_net not in emb_slices else emb_slices[depth_patch_net]
-                nb_nets_at_depths = len(emb_slices[depth_patch_net])
-                new_slc = (slice(None), slice(nb_nets_at_depths*self.output_fmaps, (nb_nets_at_depths+1)*self.output_fmaps))
-                emb_slices[depth_patch_net].append((i, new_slc))
+                emb_slices[depth_patch_net].append((i, self.construct_emb_slice(depth_patch_net, emb_slices[depth_patch_net])))
 
             self.emb_slices = emb_slices
 
+    def construct_emb_slice(self, depth, previous_emb_slices):
+        nb_nets_at_depths = len(previous_emb_slices)
+        return (
+        slice(None), slice(nb_nets_at_depths * self.output_fmaps, (nb_nets_at_depths + 1) * self.output_fmaps))
+
     def construct_embedding_heads(self, depth):
         assert depth >= self.stop_decoder_at_depth
+        raise Warning("Embedding heads do not have an activation!!")
         return ConvNormActivation(self.pyramid_fmaps, self.output_fmaps, kernel_size=(1, 1, 1),
                                   dim=3,
                                   activation=None,
@@ -1129,9 +1144,78 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
     def construct_base_module(self):
         f_in = self.encoder_fmaps[self.depth - 1]
         # f_intermediate = self.encoder_fmaps[self.depth]
+        raise Warning("Last 512 channels not used")
         f_out = self.pyramid_fmaps
         blocks_spec = deepcopy(self.res_blocks_3D[self.depth])
         return self.concatenate_res_blocks(f_in, f_out, blocks_spec, self.depth)
+
+
+class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
+    def __init__(self, *super_args,
+                 decoder_fmaps, res_blocks_decoder_3D, **super_kwargs):
+        assert isinstance(decoder_fmaps, (list, tuple))
+        self.decoder_fmaps = decoder_fmaps
+        self.res_blocks_decoder_3D = res_blocks_decoder_3D
+        super(GeneralizedUNet3D, self).__init__(*super_args, **super_kwargs)
+        print("DOne!")
+
+    def construct_merge_module(self, depth):
+        if depth >= self.stop_decoder_at_depth:
+            return MergePyramidAndAutoCrop(self.decoder_fmaps[depth], self.encoder_fmaps[depth])
+        else:
+            return None
+
+    def construct_upsampling_module(self, depth):
+        # First we need to reduce the numer of channels:
+        conv = ConvNormActivation(self.decoder_fmaps[depth+1], self.decoder_fmaps[depth], kernel_size=(1, 1, 1),
+                           dim=3,
+                           activation="ReLU",
+                           num_groups_norm=16,
+                           normalization="GroupNorm")
+
+        scale_factor = self.scale_factors[depth]
+        if scale_factor[0] == 1:
+            assert scale_factor[1] == scale_factor[2]
+
+        sampler = UpsampleAndCrop(scale_factor=scale_factor, mode=self.upsampling_mode,
+                                  crop_slice=self.decoder_crops.get(depth))
+        return nn.Sequential(conv, sampler)
+
+    def construct_decoder_module(self, depth):
+        # FIXME: this is broken. Assume to output only one embedding at the highest scale!
+        assert self.stop_decoder_at_depth == 0
+        if depth >= self.stop_decoder_at_depth:
+            f_in = self.decoder_fmaps[depth]
+            f_out = self.decoder_fmaps[depth] if depth != 0 else self.pyramid_fmaps
+
+            # Build blocks:
+            blocks_spec = deepcopy(self.res_blocks_decoder_3D[depth])
+            # FIXME: embeddings are also with ReLU and batchnorm!
+            return self.concatenate_res_blocks(f_in, f_out, blocks_spec, depth)
+            # Let's try with a super-simple conv:
+            # if depth != 0:
+            #     return ConvNormActivation(f_in, f_out, kernel_size=(1, 3, 3),
+            #                           dim=3,
+            #                           activation="ReLU",
+            #                           num_groups_norm=16,
+            #                           normalization="GroupNorm")
+            # else:
+            #     return ConvNormActivation(f_in, f_out, kernel_size=(1, 3, 3),
+            #                           dim=3,
+            #                           activation=None,
+            #                           normalization=None)
+        else:
+            return None
+
+    def construct_base_module(self):
+        f_in = self.encoder_fmaps[self.depth - 1]
+        # f_intermediate = self.encoder_fmaps[self.depth]
+        f_out = self.decoder_fmaps[self.depth]
+        blocks_spec = deepcopy(self.res_blocks_3D[self.depth])
+        return self.concatenate_res_blocks(f_in, f_out, blocks_spec, self.depth)
+
+    def construct_emb_slice(self, depth, previous_emb_slices):
+        return (slice(None), slice(None))
 
 
 class GeneralizedStackedPyramidUNet3D(nn.Module):
@@ -1139,7 +1223,9 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                  nb_stacked,
                  models_kwargs,
                  models_to_train,
-                 downscale_and_crop=None
+                 downscale_and_crop=None,
+                 type_of_model="GeneralizedFeaturePyramidUNet3D",
+                 detach_stacked_models=True
                  ):
         super(GeneralizedStackedPyramidUNet3D, self).__init__()
         assert isinstance(nb_stacked, int)
@@ -1156,8 +1242,16 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
             #     self.models_kwargs[mdl]["previous_output_from_stacked_models"] = True
 
         # Build models (now PatchNets are also automatically built here):
+        if type_of_model == "GeneralizedFeaturePyramidUNet3D":
+            model_class = GeneralizedFeaturePyramidUNet3D
+        elif type_of_model == "GeneralizedUNet3D":
+            model_class = GeneralizedUNet3D
+        else:
+            raise ValueError
+        self.type_of_model = type_of_model
+        self.detach_stacked_models = detach_stacked_models
         self.models = nn.ModuleList([
-            GeneralizedFeaturePyramidUNet3D(**kwargs) for kwargs in self.models_kwargs
+            model_class(**kwargs) for kwargs in self.models_kwargs
         ])
 
         # Collect patchNet kwargs:
@@ -1244,7 +1338,9 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
 
             # Get the first output and prepare it to be inputed to the next model:
             # (avoid backprop between models atm)
-            last_output = current_outputs[0].detach()
+            last_output = current_outputs[0]
+            if self.detach_stacked_models:
+                last_output = last_output.detach()
             if mdl in self.crop_transforms:
                 crp_shp = inputs[mdl+1].shape
                 # FIXME: generalize
