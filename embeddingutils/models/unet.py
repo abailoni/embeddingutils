@@ -997,10 +997,10 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
 
     def construct_embedding_heads(self, depth):
         assert depth >= self.stop_decoder_at_depth
-        raise Warning("Embedding heads do not have an activation!!")
+        # TODO: generalize final activation!
         return ConvNormActivation(self.pyramid_fmaps, self.output_fmaps, kernel_size=(1, 1, 1),
                                   dim=3,
-                                  activation=None,
+                                  activation='Sigmoid',
                                   normalization=None)
 
 
@@ -1208,6 +1208,15 @@ class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
 
     def construct_emb_slice(self, depth, previous_emb_slices):
         return (slice(None), slice(None))
+
+    def construct_embedding_heads(self, depth):
+        assert depth >= self.stop_decoder_at_depth
+        # TODO: generalize final activation!
+        return ConvNormActivation(self.decoder_fmaps[depth], self.output_fmaps, kernel_size=(1, 1, 1),
+                                  dim=3,
+                                  activation='Sigmoid',
+                                  normalization=None)
+
 
 
 class GeneralizedStackedPyramidUNet3D(nn.Module):
