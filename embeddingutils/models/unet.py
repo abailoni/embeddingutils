@@ -114,9 +114,12 @@ class UpsampleAndCrop(nn.Module):
             self.crop_slice = (slice(None), slice(None)) + parse_data_slice(self.crop_slice)
 
     def forward(self, input):
-        output = self.upsampler(input)
+        if isinstance(input, tuple):
+            input = input[0]
+        # print(input.shape)
         if self.crop_slice is not None:
-            output = output[self.crop_slice]
+            input = input[self.crop_slice]
+        output = self.upsampler(input)
         return output
 
 class MergePyramidAndAutoCrop(nn.Module):
@@ -930,6 +933,7 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         assert isinstance(previous_output_from_stacked_models, bool)
         self.previous_output_from_stacked_models = previous_output_from_stacked_models
         self.decoder_crops = decoder_crops if decoder_crops is not None else {}
+        self.final_crop = self.decoder_crops.get(0, None)
         # assert len(self.decoder_crops) <= 1, "For the moment maximum one crop is supported"
 
 
@@ -1033,6 +1037,13 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
             current = merge(current, encoded_state)
             current = decode(current)
 
+            # Possible final crop:
+            if depth == 0 and self.final_crop is not None:
+                assert isinstance(self.final_crop, str)
+                from inferno.io.volumetric.volumetric_utils import parse_data_slice
+                crop_slice = (slice(None), slice(None)) + parse_data_slice(self.final_crop)
+                current = current[crop_slice]
+
             if self.add_embedding_heads:
                 if str(depth) in self.emb_heads:
                     for emb_head in self.emb_heads[str(depth)]:
@@ -1055,8 +1066,9 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         if scale_factor[0] == 1:
             assert scale_factor[1] == scale_factor[2]
 
+        # print(depth, scale_factor, self.decoder_crops.get(depth-1), )
         sampler = UpsampleAndCrop(scale_factor=scale_factor, mode=self.upsampling_mode,
-                                  crop_slice=self.decoder_crops.get(depth))
+                                  crop_slice=self.decoder_crops.get(depth-1))
         return sampler
 
 
@@ -1077,11 +1089,12 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         if depth == 0:
             assert all([not is_3D for is_3D in blocks_spec]), "All blocks at highest level should be 2D"
             # Add by the default the first block:
-            blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 5, 5),
+            blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(3, 3, 3),
                                  inner_kernel_size=(1, 3, 3),
                                  activation="ReLU",
                                  normalization="GroupNorm",
                                  num_groups_norm=16,
+                                 dilation=(1,2,2)
                                  ))
             blocks_spec.pop(0)
             f_in = f_out
@@ -1169,8 +1182,10 @@ class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
         if scale_factor[0] == 1:
             assert scale_factor[1] == scale_factor[2]
 
+        # print(scale_factor, depth, self.decoder_crops.get(depth+1, None))
         sampler = UpsampleAndCrop(scale_factor=scale_factor, mode=self.upsampling_mode,
-                                  crop_slice=self.decoder_crops.get(depth))
+                                  crop_slice=self.decoder_crops.get(depth+1, None))
+
         return nn.Sequential(conv, sampler)
 
     def construct_decoder_module(self, depth):
@@ -1217,7 +1232,22 @@ class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
                                   activation='Sigmoid',
                                   normalization=None)
 
-
+    def construct_downsampling_module(self, depth):
+        scale_factor = self.scale_factors[depth]
+        kernel = (1,3,3)
+        assert all(k>=sc for k, sc in zip(kernel, scale_factor))
+        sampler = ConvNormActivation(self.encoder_fmaps[depth], self.encoder_fmaps[depth],
+                           kernel_size=kernel,
+                           dim=3,
+                           stride=scale_factor,
+                           dont_pad=True,
+                           activation="ReLU",
+                           num_groups_norm=16,
+                           normalization="GroupNorm")
+        # sampler = nn.MaxPool3d(kernel_size=scale_factor,
+        #                        stride=scale_factor,
+        #                        padding=0)
+        return sampler
 
 class GeneralizedStackedPyramidUNet3D(nn.Module):
     def __init__(self,

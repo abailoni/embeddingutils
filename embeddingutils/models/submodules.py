@@ -105,6 +105,7 @@ class ResBlockAdvanced(nn.Module):
                                         dim=dim,
                                         activation=activation,
                                         num_groups_norm=num_groups_norm,
+                                        dilation=dilation,
                                         normalization=normalization)
         self.conv2 = ConvNormActivation(f_inner, f_inner,
                                         kernel_size=inner_kernel_size, dim=dim,
@@ -113,9 +114,10 @@ class ResBlockAdvanced(nn.Module):
                                         dilation=dilation,
                                         num_groups_norm=num_groups_norm,
                                         normalization=normalization)
-        self.conv3 = ConvNormActivation(f_inner, f_out, kernel_size=1, dim=dim,
+        self.conv3 = ConvNormActivation(f_inner, f_out, kernel_size=inner_kernel_size, dim=dim,
                                         activation=activation,
                                         num_groups_norm=num_groups_norm,
+                                        dilation=dilation,
                                         normalization=normalization)
 
         self.upsampling = None
