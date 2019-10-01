@@ -922,8 +922,10 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
                  stop_decoder_at_depth=0, # Sometimes we stop the decoder earlier
                  previous_output_from_stacked_models=False,
                  add_embedding_heads=False,
+                 strided_res_blocks=False,
                  **kwargs):
         # TODO: assert all this stuff
+        self.strided_res_blocks = strided_res_blocks
         self.depth = depth
         self.in_channels = in_channels
         self.pyramid_fmaps = pyramid_fmaps
@@ -1086,37 +1088,73 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         assert f_out % 16 == 0, "Not divisible for group norm!"
 
         blocks_list = []
-        if depth == 0:
-            assert all([not is_3D for is_3D in blocks_spec]), "All blocks at highest level should be 2D"
-            # Add by the default the first block:
-            blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(3, 3, 3),
-                                 inner_kernel_size=(1, 3, 3),
-                                 activation="ReLU",
-                                 normalization="GroupNorm",
-                                 num_groups_norm=16,
-                                 dilation=(1,2,2)
-                                 ))
-            blocks_spec.pop(0)
-            f_in = f_out
+        if not self.strided_res_blocks:
+            if depth == 0:
+                assert all([not is_3D for is_3D in blocks_spec]), "All blocks at highest level should be 2D"
+                # Add by the default the first block:
+                blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(3, 3, 3),
+                                     inner_kernel_size=(1, 3, 3),
+                                     activation="ReLU",
+                                     normalization="GroupNorm",
+                                     num_groups_norm=16,
+                                     dilation=(1,2,2)
+                                     ))
+                blocks_spec.pop(0)
+                f_in = f_out
 
-        # Concatenate possible additional blocks:
-        for is_3D in blocks_spec:
-            assert isinstance(is_3D, bool)
-            if is_3D:
-                blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
-                                 inner_kernel_size=(3, 3, 3),
-                                 activation="ReLU",
-                                 normalization="GroupNorm",
-                                 num_groups_norm=16,
-                                 ))
-            else:
-                blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
-                                 inner_kernel_size=(1, 3, 3),
-                                 activation="ReLU",
-                                 normalization="GroupNorm",
-                                 num_groups_norm=16,
-                                 ))
-            f_in = f_out
+            # Concatenate possible additional blocks:
+            for is_3D in blocks_spec:
+                assert isinstance(is_3D, bool)
+                if is_3D:
+                    blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                     inner_kernel_size=(3, 3, 3),
+                                     activation="ReLU",
+                                     normalization="GroupNorm",
+                                     num_groups_norm=16,
+                                     ))
+                else:
+                    blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                     inner_kernel_size=(1, 3, 3),
+                                     activation="ReLU",
+                                     normalization="GroupNorm",
+                                     num_groups_norm=16,
+                                     ))
+                f_in = f_out
+        else:
+            dilation = (1, 3, 3) if depth <= 1 else (2, 2, 2)
+            if depth == 0:
+                assert all([not is_3D for is_3D in blocks_spec]), "All blocks at highest level should be 2D"
+                # Add by the default the first block:
+                blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(3, 3, 3),
+                                                    inner_kernel_size=(1, 3, 3),
+                                                    activation="ReLU",
+                                                    normalization="GroupNorm",
+                                                    num_groups_norm=16,
+                                                    dilation=dilation
+                                                    ))
+                blocks_spec.pop(0)
+                f_in = f_out
+
+            # Concatenate possible additional blocks:
+            for is_3D in blocks_spec:
+                assert isinstance(is_3D, bool)
+                if is_3D:
+                    blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                                        inner_kernel_size=(3, 3, 3),
+                                                        activation="ReLU",
+                                                        normalization="GroupNorm",
+                                                        num_groups_norm=16,
+                                                        dilation=dilation
+                                                        ))
+                else:
+                    blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                                                        inner_kernel_size=(1, 3, 3),
+                                                        activation="ReLU",
+                                                        normalization="GroupNorm",
+                                                        num_groups_norm=16,
+                                                        dilation=dilation
+                                                        ))
+                f_in = f_out
 
         return nn.Sequential(*blocks_list)
 
@@ -1157,12 +1195,12 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
 
 class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
     def __init__(self, *super_args,
-                 decoder_fmaps, res_blocks_decoder_3D, **super_kwargs):
+                 decoder_fmaps, res_blocks_decoder_3D,
+                 **super_kwargs):
         assert isinstance(decoder_fmaps, (list, tuple))
         self.decoder_fmaps = decoder_fmaps
         self.res_blocks_decoder_3D = res_blocks_decoder_3D
         super(GeneralizedUNet3D, self).__init__(*super_args, **super_kwargs)
-        print("DOne!")
 
     def construct_merge_module(self, depth):
         if depth >= self.stop_decoder_at_depth:
@@ -1255,6 +1293,7 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                  models_kwargs,
                  models_to_train,
                  downscale_and_crop=None,
+                 add_foreground_prediction_module=False,
                  type_of_model="GeneralizedFeaturePyramidUNet3D",
                  detach_stacked_models=True
                  ):
@@ -1325,6 +1364,13 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
         ])
 
 
+        self.add_foreground_prediction_module = add_foreground_prediction_module
+        if add_foreground_prediction_module:
+            self.foreground_module = nn.Sequential(
+                ConvNormActivation(in_channels=self.models[-1].output_fmaps, out_channels=int(self.models[-1].output_fmaps/4),
+                           kernel_size=(1, 3, 3), dim=3, activation='ReLU', normalization="GroupNorm", num_groups_norm=16),
+                ConvNormActivation(in_channels=int(self.models[-1].output_fmaps/4), out_channels=1,
+                                   kernel_size=(1, 3, 3), dim=3, activation='Sigmoid', normalization=None))
 
         # TODO: not sure it changes anything...
         self.fix_batchnorm_problem()
@@ -1730,30 +1776,58 @@ class StackedAffinityNet(nn.Module):
 
 
 class GeneralizedAffinitiesFromEmb(nn.Module):
-    def __init__(self, path_model, nb_offsets):
+    def __init__(self, path_model, nb_offsets, train_backbone=False, use_ASPP_module=False, reload_backbone=True):
         super(GeneralizedAffinitiesFromEmb, self).__init__()
 
-        self.stacked_model = torch.load(path_model)["_model"]
-
-        # Freeze-parameters for models that are not trained:
-        for param in self.stacked_model.parameters():
-            param.requires_grad = False
+        self.path_model = path_model
+        self.train_backbone = train_backbone
+        self.reload_backbone = reload_backbone
+        self.load_backbone()
 
         output_maps = self.stacked_model.models[-1].output_fmaps
 
-        self.final_module = nn.Sequential(
-            Conv3D(in_channels=output_maps, out_channels=nb_offsets,
-                   kernel_size=(1, 5, 5))
-        )
+        if use_ASPP_module:
+            from vaeAffs.models.ASPP import ASPP3D
+            inner_planes = int(output_maps/2)
+            dilations = [(1,18,18), (1,36,36), (1,54,54), (3, 18, 18)]
+            aspp_module = ASPP3D(inplanes=output_maps, inner_planes=inner_planes, dilations=dilations, num_norm_groups=16)
+            final_conv = Conv3D(in_channels=inner_planes, out_channels=nb_offsets,
+                       kernel_size=1)
+            self.final_module = nn.Sequential(aspp_module, final_conv)
+        else:
+            self.final_module = nn.Sequential(
+                Conv3D(in_channels=output_maps, out_channels=nb_offsets,
+                       kernel_size=(1, 5, 5))
+            )
 
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, *inputs):
         with torch.no_grad():
             current = self.stacked_model(*inputs)
-        assert len(current) == 1
-        current = self.final_module(current[0])
+        current = current[-1]
+        from speedrun.log_anywhere import log_image, log_embedding, log_scalar
+        if current.device == torch.device(0):
+            log_image("embeddings", current)
+        current = self.final_module(current)
         return self.sigmoid(current)
+
+    def load_state_dict(self, state_dict):
+        super(GeneralizedAffinitiesFromEmb, self).load_state_dict(state_dict)
+        # Reload backbone:
+        if self.reload_backbone:
+            self.load_backbone()
+
+    def load_backbone(self):
+        self.stacked_model = torch.load(self.path_model)["_model"]
+
+        # Freeze-parameters for models that are not trained:
+        if not self.train_backbone:
+            print("Backbone parameters freezed!")
+            for param in self.stacked_model.parameters():
+                param.requires_grad = False
+
+
 
 
 class MaskUNet(UNet3D):
