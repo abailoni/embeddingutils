@@ -923,9 +923,13 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
                  previous_output_from_stacked_models=False,
                  add_embedding_heads=False,
                  strided_res_blocks=False,
+                 add_final_conv_in_res_block=False,
+                 pre_kernel_size_res_block=(1,3,3),
                  **kwargs):
         # TODO: assert all this stuff
         self.strided_res_blocks = strided_res_blocks
+        self.add_final_conv_in_res_block = add_final_conv_in_res_block
+        self.pre_kernel_size_res_block = pre_kernel_size_res_block
         self.depth = depth
         self.in_channels = in_channels
         self.pyramid_fmaps = pyramid_fmaps
@@ -1089,28 +1093,29 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
 
         blocks_list = []
         if not self.strided_res_blocks:
-            if depth == 0:
-                assert all([not is_3D for is_3D in blocks_spec]), "All blocks at highest level should be 2D"
-                # Add by the default the first block:
-                blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(3, 3, 3),
-                                     inner_kernel_size=(1, 3, 3),
-                                     activation="ReLU",
-                                     normalization="GroupNorm",
-                                     num_groups_norm=16,
-                                     dilation=(1,2,2)
-                                     ))
-                blocks_spec.pop(0)
-                f_in = f_out
+            # if depth == 0:
+            #     # assert all([not is_3D for is_3D in blocks_spec]), "All blocks at highest level should be 2D"
+            #     # Add by the default the first block:
+            #     blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+            #                          inner_kernel_size=(3, 3, 3),
+            #                          activation="ReLU",
+            #                          normalization="GroupNorm",
+            #                          num_groups_norm=16,
+            #                          dilation=(1,2,2)
+            #                          ))
+            #     blocks_spec.pop(0)
+            #     f_in = f_out
 
             # Concatenate possible additional blocks:
             for is_3D in blocks_spec:
                 assert isinstance(is_3D, bool)
                 if is_3D:
-                    blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
+                    blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(3, 3, 3),
                                      inner_kernel_size=(3, 3, 3),
                                      activation="ReLU",
                                      normalization="GroupNorm",
                                      num_groups_norm=16,
+                                                        add_final_conv=self.add_final_conv_in_res_block
                                      ))
                 else:
                     blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),
@@ -1170,8 +1175,20 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
 
         # Build blocks:
         blocks_spec = deepcopy(self.res_blocks_3D[depth])
-        return self.concatenate_res_blocks(f_in, f_out, blocks_spec, depth)
 
+        if depth == 0:
+            first_conv = ConvNormActivation(f_in, f_out, kernel_size=(1, 5, 5),
+                                           dim=3,
+                                           activation="ReLU",
+                                           num_groups_norm=16,
+                                           normalization="GroupNorm")
+            # Here the block has a different number of inpiut channels:
+            res_block = self.concatenate_res_blocks(f_out, f_out, blocks_spec, depth)
+            res_block = nn.Sequential(first_conv, res_block)
+        else:
+            res_block = self.concatenate_res_blocks(f_in, f_out, blocks_spec, depth)
+
+        return res_block
 
     def construct_decoder_module(self, depth):
         if depth >= self.stop_decoder_at_depth:
@@ -1231,12 +1248,20 @@ class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
         assert self.stop_decoder_at_depth == 0
         if depth >= self.stop_decoder_at_depth:
             f_in = self.decoder_fmaps[depth]
-            f_out = self.decoder_fmaps[depth] if depth != 0 else self.pyramid_fmaps
+            f_out = self.decoder_fmaps[depth]
 
             # Build blocks:
             blocks_spec = deepcopy(self.res_blocks_decoder_3D[depth])
-            # FIXME: embeddings are also with ReLU and batchnorm!
-            return self.concatenate_res_blocks(f_in, f_out, blocks_spec, depth)
+            # Remark: embeddings are also with ReLU and batchnorm!
+            res_block = self.concatenate_res_blocks(f_in, f_out, blocks_spec, depth)
+            if depth == 0:
+                last_conv = ConvNormActivation(f_out, f_out, kernel_size=(1, 5, 5),
+                           dim=3,
+                           activation="ReLU",
+                           num_groups_norm=16,
+                           normalization="GroupNorm")
+                res_block = nn.Sequential(res_block, last_conv)
+            return res_block
             # Let's try with a super-simple conv:
             # if depth != 0:
             #     return ConvNormActivation(f_in, f_out, kernel_size=(1, 3, 3),
@@ -1272,10 +1297,10 @@ class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
 
     def construct_downsampling_module(self, depth):
         scale_factor = self.scale_factors[depth]
-        kernel = (1,3,3)
-        assert all(k>=sc for k, sc in zip(kernel, scale_factor))
+        # kernel = (1,3,3)
+        # assert all(k>=sc for k, sc in zip(kernel, scale_factor))
         sampler = ConvNormActivation(self.encoder_fmaps[depth], self.encoder_fmaps[depth],
-                           kernel_size=kernel,
+                           kernel_size=scale_factor,
                            dim=3,
                            stride=scale_factor,
                            dont_pad=True,
@@ -1292,7 +1317,7 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                  nb_stacked,
                  models_kwargs,
                  models_to_train,
-                 downscale_and_crop=None,
+                 stacked_upscl_fact=None,
                  add_foreground_prediction_module=False,
                  type_of_model="GeneralizedFeaturePyramidUNet3D",
                  detach_stacked_models=True
@@ -1351,16 +1376,16 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                 for param in self.models[mdl].parameters():
                     param.requires_grad = False
 
-        # Build crop-modules:
-        from vaeAffs.transforms import DownsampleAndCrop3D
-        self.downscale_and_crop = downscale_and_crop if downscale_and_crop is not None else {}
-        # TODO: deprecated (now an auto-crop is used)
-        self.crop_transforms = {mdl: DownsampleAndCrop3D(**self.downscale_and_crop[mdl]) for mdl in self.downscale_and_crop}
+        # # Build crop-modules:
+        # from vaeAffs.transforms import DownsampleAndCrop3D
+        # self.downscale_and_crop = downscale_and_crop if downscale_and_crop is not None else {}
+        # # TODO: deprecated (now an auto-crop is used)
+        # self.crop_transforms = {mdl: DownsampleAndCrop3D(**self.downscale_and_crop[mdl]) for mdl in self.downscale_and_crop}
 
-
-        # FIXME: generalize
+        self.stacked_upscl_fact = stacked_upscl_fact if stacked_upscl_fact is not None else []
+        assert len(self.stacked_upscl_fact) == self.nb_stacked - 1
         self.upsample_modules = nn.ModuleList([
-            Upsample(scale_factor=tuple(scl_fact), mode="nearest") for scl_fact in [[1,3,3]]
+            Upsample(scale_factor=tuple(scl_fact), mode="nearest") for scl_fact in self.stacked_upscl_fact
         ])
 
 
@@ -1374,6 +1399,7 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
 
         # TODO: not sure it changes anything...
         self.fix_batchnorm_problem()
+        self.first_debug_print = True
 
     def fix_batchnorm_problem(self):
         for m in self.modules():
@@ -1405,33 +1431,40 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                     # current_outputs = self.models[mdl](inputs[mdl], last_output)
                     current_outputs = self.models[mdl](torch.cat((inputs[mdl], last_output), dim=1))
 
-
+            # print("Mdl {}, memory {} - {}".format(mdl, torch.cuda.memory_allocated(0)/1000000, torch.cuda.memory_cached(0)/1000000,))
+            # torch.cuda.empty_cache()
             if mdl in self.models_to_train:
                 output_features += current_outputs
 
             # Check if we should stop because next models are not trained:
             if mdl+1 > self.last_model_to_train:
+                # if self.first_debug_print and last_output.device == torch.device('cuda:0'):
+                #     print("Output shape: ", current_outputs[0].shape, " || Input shape: ", inputs[mdl].shape)
                 break
 
-            # Get the first output and prepare it to be inputed to the next model:
+            # Get the first output and prepare it to be inputed to the next model (if not the last):
             # (avoid backprop between models atm)
-            last_output = current_outputs[0]
-            if self.detach_stacked_models:
-                last_output = last_output.detach()
-            if mdl in self.crop_transforms:
+            if mdl != self.nb_stacked - 1:
+                last_output = current_outputs[0]
+                if self.detach_stacked_models:
+                    last_output = last_output.detach()
+
+                # Get input shape of the next stacked model:
                 crp_shp = inputs[mdl+1].shape
-                # FIXME: generalize
-                crp_shp = crp_shp[:3] + (int(crp_shp[3]/3), int(crp_shp[4]/3))
+                # Get next-input shape before to upscale:
+                crp_shp = crp_shp[:2] + tuple(int(crp_shp[i+2]/self.stacked_upscl_fact[mdl][i]) for i in range(3))
+                # Auto-crop:
+                # if self.first_debug_print and last_output.device == torch.device('cuda:0'):
+                #     print("Output shape: ", last_output.shape, " || Target shape: ", crp_shp, " || Input shape: ", inputs[mdl].shape)
                 last_output = auto_crop_tensor_to_shape(last_output, crp_shp)
-                # last_output = self.crop_transforms[mdl].apply_to_torch_tensor(last_output)
+                # Up-sample:
                 last_output = self.upsample_modules[mdl](last_output)
                 from speedrun.log_anywhere import log_image, log_embedding, log_scalar
                 # print(last_output.device)
-                if last_output.device == torch.device('cuda:0'):
-                    log_image("prev_output", last_output)
+                # if last_output.device == torch.device('cuda:0'):
+                #     log_image("output_mdl_{}".format(mdl), last_output)
 
-
-
+        self.first_debug_print = False
         return output_features
 
 
@@ -1615,7 +1648,8 @@ class UNet3D(UNetSkeleton):
     def construct_downsampling_module(self, depth):
         scale_factor = self.scale_factors[depth]
         sampler = nn.MaxPool3d(kernel_size=scale_factor,
-                               stride=scale_factor,
+                               # stride=scale_factor,
+                               # ceil_mode=True,
                                padding=0)
         return sampler
 
@@ -1776,7 +1810,8 @@ class StackedAffinityNet(nn.Module):
 
 
 class GeneralizedAffinitiesFromEmb(nn.Module):
-    def __init__(self, path_model, nb_offsets, train_backbone=False, use_ASPP_module=False, reload_backbone=True):
+    def __init__(self, path_model, nb_offsets, train_backbone=False, use_ASPP_module=False, reload_backbone=True,
+                 ASPP_inner_planes=64, ASPP_dilations=None, prediction_index=None):
         super(GeneralizedAffinitiesFromEmb, self).__init__()
 
         self.path_model = path_model
@@ -1788,10 +1823,13 @@ class GeneralizedAffinitiesFromEmb(nn.Module):
 
         if use_ASPP_module:
             from vaeAffs.models.ASPP import ASPP3D
-            inner_planes = int(output_maps/2)
-            dilations = [(1,18,18), (1,36,36), (1,54,54), (3, 18, 18)]
-            aspp_module = ASPP3D(inplanes=output_maps, inner_planes=inner_planes, dilations=dilations, num_norm_groups=16)
-            final_conv = Conv3D(in_channels=inner_planes, out_channels=nb_offsets,
+            if ASPP_dilations is None:
+                ASPP_dilations = [(1,18,18), (1,36,36), (1,54,54), (3, 18, 18)]
+            else:
+                assert isinstance(ASPP_dilations, list) and all(isinstance(dil, list) for dil in ASPP_dilations)
+                ASPP_dilations = [tuple(dil) for dil in ASPP_dilations]
+            aspp_module = ASPP3D(inplanes=output_maps, inner_planes=ASPP_inner_planes, dilations=ASPP_dilations, num_norm_groups=16)
+            final_conv = Conv3D(in_channels=ASPP_inner_planes, out_channels=nb_offsets,
                        kernel_size=1)
             self.final_module = nn.Sequential(aspp_module, final_conv)
         else:
@@ -1801,11 +1839,15 @@ class GeneralizedAffinitiesFromEmb(nn.Module):
             )
 
         self.sigmoid = nn.Sigmoid()
+        self.prediction_index = prediction_index
 
     def forward(self, *inputs):
         with torch.no_grad():
             current = self.stacked_model(*inputs)
-        current = current[-1]
+        if self.prediction_index is not None:
+            current = current[self.prediction_index]
+        else:
+            current = current[-1]
         from speedrun.log_anywhere import log_image, log_embedding, log_scalar
         if current.device == torch.device(0):
             log_image("embeddings", current)

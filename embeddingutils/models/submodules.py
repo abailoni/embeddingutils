@@ -85,6 +85,7 @@ class ResBlockAdvanced(nn.Module):
                  apply_final_activation=True,
                  apply_final_normalization=True,
                  upsampling_factor=None,
+                 add_final_conv=False,
                  dilation=1):
         super(ResBlockAdvanced, self).__init__()
         f_inner = f_in if f_inner is None else f_inner
@@ -95,7 +96,7 @@ class ResBlockAdvanced(nn.Module):
 
         self.skip_con = None
         if stride != 1 or f_in != f_out:
-            self.skip_con = ConvNormActivation(f_in, f_out, kernel_size=1, dim=dim,
+            self.skip_con = ConvNormActivation(f_inner, f_out, kernel_size=1, dim=dim,
                                                activation=activation,
                                                stride=stride,
                                                num_groups_norm=num_groups_norm,
@@ -114,35 +115,58 @@ class ResBlockAdvanced(nn.Module):
                                         dilation=dilation,
                                         num_groups_norm=num_groups_norm,
                                         normalization=normalization)
-        self.conv3 = ConvNormActivation(f_inner, f_out, kernel_size=inner_kernel_size, dim=dim,
-                                        activation=activation,
-                                        num_groups_norm=num_groups_norm,
-                                        dilation=dilation,
-                                        normalization=normalization)
-
+        self.add_final_conv = add_final_conv
+        if add_final_conv:
+            self.conv3 = ConvNormActivation(f_inner, f_inner,
+                                            kernel_size=inner_kernel_size, dim=dim,
+                                            activation=activation,
+                                            dilation=dilation,
+                                            num_groups_norm=num_groups_norm,
+                                            normalization=normalization)
+            self.conv4 = ConvNormActivation(f_inner, f_out, kernel_size=inner_kernel_size, dim=dim,
+                                            activation=activation,
+                                            num_groups_norm=num_groups_norm,
+                                            dilation=dilation,
+                                            normalization=normalization)
+        else:
+            self.conv3 = ConvNormActivation(f_inner, f_out,
+                                            kernel_size=inner_kernel_size, dim=dim,
+                                            activation=activation,
+                                            dilation=dilation,
+                                            num_groups_norm=num_groups_norm,
+                                            normalization=normalization)
         self.upsampling = None
         if upsampling_factor is not None:
+            raise ValueError()
             assert len(upsampling_factor) == dim
             self.upsampling = Upsample(scale_factor=upsampling_factor, mode="nearest")
 
     def forward(self, input):
-        x = self.conv1(input)
+        skip_conn = self.conv1.conv(input)
+        x = self.conv1.normalization(skip_conn) if self.conv1.normalization is not None else skip_conn
+        x = self.conv1.activation(x) if self.conv1.activation is not None else x
+        if self.skip_con is not None:
+            # Take the output of conv1 (including norm and act) and apply 1x1 conv:
+            skip_conn = self.skip_con.conv(x)
         x = self.conv2(x)
         x = self.conv3.conv(x)
-        if self.apply_final_normalization and self.conv3.normalization is not None:
-            x = self.conv3.normalization(x)
+        x = x + skip_conn
+        if self.add_final_conv:
+            x = self.conv3.normalization(x) if self.conv3.normalization is not None else x
+            x = self.conv4.conv(self.conv3.activation(x)) if self.conv3.activation is not None else self.conv4.conv(x)
 
-        if self.skip_con is not None:
-            input = self.skip_con.conv(input)
-            if self.apply_final_normalization and self.skip_con.normalization is not None:
-                input = self.skip_con.normalization(input)
 
-        x = x + input
-        if self.apply_final_activation:
-            x = self.conv3.activation(x)
+            if self.apply_final_normalization and self.conv4.normalization is not None:
+                x = self.conv4.normalization(x)
 
-        if self.upsampling is not None:
-            x = self.upsampling(x)
+            if self.apply_final_activation  and self.conv4.activation is not None:
+                x = self.conv4.activation(x)
+        else:
+            if self.apply_final_normalization and self.conv3.normalization is not None:
+                x = self.conv3.normalization(x)
+
+            if self.apply_final_activation  and self.conv3.activation is not None:
+                x = self.conv3.activation(x)
 
         return x
 
