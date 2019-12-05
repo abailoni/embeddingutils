@@ -1383,10 +1383,10 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
         current = inputs[0]
         for encode, downsample, depth in zip(self.encoder_modules, self.downsampling_modules,
                                       range(self.depth)):
+            from speedrun.log_anywhere import log_image, log_embedding, log_scalar
             if depth == 1:
                 current_lvl0_padded = self.autopad_first_encoding(current, inputs[1].shape)
                 # -------- DEBUG -----------
-                from speedrun.log_anywhere import log_image, log_embedding, log_scalar
                 # TODO: pad input and check if it fits...
                 inputs_DS = inputs[0][:,:,:,::2,::2]
                 inputs_DS_padded = self.autopad_first_encoding(inputs_DS, inputs[1].shape)
@@ -1399,7 +1399,10 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
                 current = encode(current)
             encoded_states.append(current)
             current = downsample(current)
+            if depth > 0:
+                log_image("encoder_layer_depth_{}".format(depth), current)
         current = self.base_module(current)
+        log_image("encoder_layer_depth_base", current)
 
         emb_outputs = []
         for encoded_state, upsample, skip, merge, decode, depth in reversed(list(zip(
