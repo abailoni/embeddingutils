@@ -122,6 +122,26 @@ class UpsampleAndCrop(nn.Module):
         output = self.upsampler(input)
         return output
 
+class Crop(nn.Module):
+    def __init__(self, crop_slice):
+        super(Crop, self).__init__()
+        self.crop_slice = crop_slice
+
+        if self.crop_slice is not None:
+            assert isinstance(self.crop_slice, str)
+            from inferno.io.volumetric.volumetric_utils import parse_data_slice
+            self.crop_slice = (slice(None), slice(None)) + parse_data_slice(self.crop_slice)
+
+    def forward(self, input):
+        if isinstance(input, tuple):
+            raise NotImplementedError("At the moment only one input is accepted")
+        if self.crop_slice is not None:
+            return input[self.crop_slice]
+        else:
+            return input
+
+
+
 class MergePyramidAndAutoCrop(nn.Module):
     def __init__(self, pyramid_feat, backbone_feat):
         super(MergePyramidAndAutoCrop, self).__init__()
@@ -140,13 +160,40 @@ class MergePyramidAndAutoCrop(nn.Module):
             target_shape = previous_pyramid.shape[2:]
             orig_shape = backbone.shape[2:]
             diff = [orig-trg for orig, trg in zip(orig_shape, target_shape)]
-            assert all([d>=0 for d in diff]), "Target should be smaller than original tensor"
+            crop_backbone = True
+            if not all([d>=0 for d in diff]):
+                crop_backbone = False
+                orig_shape, target_shape = target_shape, orig_shape
+                diff = [orig - trg for orig, trg in zip(orig_shape, target_shape)]
             left_crops = [int(d/2) for d in diff]
             right_crops = [shp-int(d/2) if d%2==0 else shp-(int(d/2)+1)  for d, shp in zip(diff, orig_shape)]
             crop_slice = (slice(None), slice(None)) + tuple(slice(lft,rgt) for rgt,lft in zip(right_crops, left_crops))
-            backbone = backbone[crop_slice]
+            if crop_backbone:
+                backbone = backbone[crop_slice]
+            else:
+                previous_pyramid = previous_pyramid[crop_slice]
 
         return self.conv(backbone) + previous_pyramid
+
+
+class AutoPad(nn.Module):
+    def __init__(self):
+        super(AutoPad, self).__init__()
+
+    def forward(self, to_be_padded, out_shape):
+        in_shape = to_be_padded.shape[2:]
+        out_shape = out_shape[2:]
+        if in_shape != out_shape:
+            diff = [trg-orig for orig, trg in zip(in_shape, out_shape)]
+            assert all([d>=0 for d in diff]), "Output shape should be bigger"
+            assert all([d % 2 == 0 for d in diff]), "Odd difference in shape!"
+            # F.pad expects the last dim first:
+            diff.reverse()
+            pad = []
+            for d in diff:
+                pad += [int(d/2), int(d/2)]
+            to_be_padded = torch.nn.functional.pad(to_be_padded, tuple(pad), mode='constant', value=0)
+        return to_be_padded
 
 
 def auto_crop_tensor_to_shape(to_be_cropped, target_tensor_shape, return_slice=False,
@@ -929,8 +976,10 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         # TODO: assert all this stuff
         self.strided_res_blocks = strided_res_blocks
         self.add_final_conv_in_res_block = add_final_conv_in_res_block
-        self.pre_kernel_size_res_block = pre_kernel_size_res_block
         self.depth = depth
+        if isinstance(pre_kernel_size_res_block, list):
+            pre_kernel_size_res_block = tuple(pre_kernel_size_res_block)
+        self.pre_kernel_size_res_block = pre_kernel_size_res_block
         self.in_channels = in_channels
         self.pyramid_fmaps = pyramid_fmaps
         self.output_fmaps = pyramid_fmaps if output_fmaps is None else output_fmaps
@@ -986,7 +1035,7 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
                 depth_patch_net = patchNet_kwargs[i].get("depth_level", 0)
                 emb_heads[depth_patch_net] = [] if depth_patch_net not in emb_heads else emb_heads[depth_patch_net]
                 emb_heads[depth_patch_net].append(
-                    self.construct_embedding_heads(depth_patch_net))
+                    self.construct_embedding_heads(depth_patch_net, nb_patch_net=i))
 
             self.emb_heads = nn.ModuleDict(
                 {str(dpth): nn.ModuleList(emb_heads[dpth]) for dpth in emb_heads}
@@ -1005,7 +1054,7 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
         return (
         slice(None), slice(nb_nets_at_depths * self.output_fmaps, (nb_nets_at_depths + 1) * self.output_fmaps))
 
-    def construct_embedding_heads(self, depth):
+    def construct_embedding_heads(self, depth, nb_patch_net=None):
         assert depth >= self.stop_decoder_at_depth
         # TODO: generalize final activation!
         return ConvNormActivation(self.pyramid_fmaps, self.output_fmaps, kernel_size=(1, 1, 1),
@@ -1110,7 +1159,7 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
             for is_3D in blocks_spec:
                 assert isinstance(is_3D, bool)
                 if is_3D:
-                    blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(3, 3, 3),
+                    blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=self.pre_kernel_size_res_block,
                                      inner_kernel_size=(3, 3, 3),
                                      activation="ReLU",
                                      normalization="GroupNorm",
@@ -1312,6 +1361,129 @@ class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
         #                        padding=0)
         return sampler
 
+class MultiScaleInputsUNet3D(GeneralizedUNet3D):
+    def __init__(self,
+                 *super_args,
+                 **super_kwargs):
+        """
+        The crops in the decode have been moved after ASPP, so that we leave the big context available
+        """
+        super(MultiScaleInputsUNet3D, self).__init__(*super_args, **super_kwargs)
+
+        # Construct the extra modules:
+        self.autopad_first_encoding = AutoPad()
+
+
+
+    def forward(self, *inputs):
+        nb_inputs = len(inputs)
+        assert nb_inputs == 2, "Only two inputs accepted for the moment"
+
+        encoded_states = []
+        current = inputs[0]
+        for encode, downsample, depth in zip(self.encoder_modules, self.downsampling_modules,
+                                      range(self.depth)):
+            if depth == 1:
+                current_lvl0_padded = self.autopad_first_encoding(current, inputs[1].shape)
+                # -------- DEBUG -----------
+                from speedrun.log_anywhere import log_image, log_embedding, log_scalar
+                # TODO: pad input and check if it fits...
+                inputs_DS = inputs[0][:,:,:,::2,::2]
+                inputs_DS_padded = self.autopad_first_encoding(inputs_DS, inputs[1].shape)
+                log_image("input_ds", inputs_DS_padded)
+                log_image("mid_layer", current_lvl0_padded)
+                # -------- DEBUG -----------
+                current = torch.cat((current_lvl0_padded, inputs[1]), dim=1)
+                current = encode(current)
+            else:
+                current = encode(current)
+            encoded_states.append(current)
+            current = downsample(current)
+        current = self.base_module(current)
+
+        emb_outputs = []
+        for encoded_state, upsample, skip, merge, decode, depth in reversed(list(zip(
+                encoded_states, self.upsampling_modules, self.skip_modules, self.merge_modules, self.decoder_modules, range(len(self.decoder_modules))))):
+            if depth < self.stop_decoder_at_depth:
+                break
+            current = upsample(current)
+            current = merge(current, encoded_state)
+            current = decode(current)
+
+            if self.add_embedding_heads:
+                if str(depth) in self.emb_heads:
+                    for emb_head in self.emb_heads[str(depth)]:
+                        emb_out = emb_head(current)
+                        emb_outputs.append(emb_out)
+            else:
+                if depth in self.emb_slices:
+                    for emb_slc in self.emb_slices[depth]:
+                        emb_out = current[emb_slc[1]]
+                        emb_outputs.append(emb_out)
+
+
+        emb_outputs.reverse()
+
+        return emb_outputs
+
+    def construct_merge_module(self, depth):
+        if depth >= self.stop_decoder_at_depth:
+            return MergePyramidAndAutoCrop(self.decoder_fmaps[depth], self.encoder_fmaps[depth])
+        else:
+            return None
+
+    def construct_embedding_heads(self, depth, nb_patch_net=None):
+        assert nb_patch_net is not None
+        ptch_kwargs = self.ptch_kwargs[nb_patch_net]
+        ASPP_kwargs = ptch_kwargs.get("ASPP_kwargs", {})
+        dilations = ASPP_kwargs.get("dilations", [[1,6,6], [1,12,12], [3,1,1]])
+        assert isinstance(dilations, list) and all(isinstance(dil, list) for dil in dilations)
+        dilations = [tuple(dil) for dil in dilations]
+        from vaeAffs.models.ASPP import ASPP3D
+        ASPP_inner_planes = ASPP_kwargs.get("inner_planes", self.decoder_fmaps[depth])
+        aspp_module = ASPP3D(inplanes=self.decoder_fmaps[depth],
+                             inner_planes=ASPP_inner_planes,
+                             output_planes=ptch_kwargs["latent_variable_size"],
+                             dilations=dilations,
+                             num_norm_groups=16)
+
+        crop = self.decoder_crops.get(depth, None)
+        aspp_module = nn.Sequential(aspp_module, Crop(crop)) if crop is not None else aspp_module
+
+        return aspp_module
+
+    def construct_encoder_module(self, depth):
+        if depth == 0:
+            f_in = self.in_channels
+        elif depth == 1:
+            f_in = self.encoder_fmaps[depth - 1] + self.in_channels
+        else:
+            f_in = self.encoder_fmaps[depth - 1]
+        f_out = self.encoder_fmaps[depth]
+
+        # Increase input channels if we expect outputs from previous stacked models:
+        if depth == 1 and self.previous_output_from_stacked_models:
+            f_in = self.pyramid_fmaps + self.encoder_fmaps[0]
+            assert f_in <= f_out, "Bottleneck! Output channels are less the input ones"
+
+        # Build blocks:
+        blocks_spec = deepcopy(self.res_blocks_3D[depth])
+
+        if depth == 0:
+            first_conv = ConvNormActivation(f_in, f_out, kernel_size=(1, 5, 5),
+                                           dim=3,
+                                           activation="ReLU",
+                                           num_groups_norm=16,
+                                           normalization="GroupNorm")
+            # Here the block has a different number of inpiut channels:
+            res_block = self.concatenate_res_blocks(f_out, f_out, blocks_spec, depth)
+            res_block = nn.Sequential(first_conv, res_block)
+        else:
+            res_block = self.concatenate_res_blocks(f_in, f_out, blocks_spec, depth)
+
+        return res_block
+
+
 class GeneralizedStackedPyramidUNet3D(nn.Module):
     def __init__(self,
                  nb_stacked,
@@ -1320,11 +1492,13 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                  stacked_upscl_fact=None,
                  add_foreground_prediction_module=False,
                  type_of_model="GeneralizedFeaturePyramidUNet3D",
-                 detach_stacked_models=True
+                 detach_stacked_models=True,
+                 nb_inputs_per_model=1
                  ):
         super(GeneralizedStackedPyramidUNet3D, self).__init__()
         assert isinstance(nb_stacked, int)
         self.nb_stacked = nb_stacked
+        self.nb_inputs_per_model = nb_inputs_per_model
 
         # Collect models kwargs:
         global_kwargs = models_kwargs.pop("global", {})
@@ -1341,6 +1515,8 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
             model_class = GeneralizedFeaturePyramidUNet3D
         elif type_of_model == "GeneralizedUNet3D":
             model_class = GeneralizedUNet3D
+        elif type_of_model == "MultiScaleInputsUNet3D":
+            model_class = MultiScaleInputsUNet3D
         else:
             raise ValueError
         self.type_of_model = type_of_model
@@ -1408,7 +1584,9 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, *inputs):
-        assert len(inputs) == self.nb_stacked
+        assert len(inputs) == self.nb_stacked * self.nb_inputs_per_model
+        if self.nb_inputs_per_model != 1:
+            inputs = tuple(inputs[i*self.nb_inputs_per_model:(i+1)*self.nb_inputs_per_model]  for i in range(self.nb_stacked))
 
         # Apply stacked models:
         last_output = None
@@ -1419,7 +1597,10 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
             no_grad = torch.no_grad if mdl not in self.models_to_train else contextlib.nullcontext
             with no_grad():
                 if mdl == 0:
-                    current_outputs = self.models[mdl](inputs[mdl])
+                    if self.nb_inputs_per_model == 1:
+                        current_outputs = self.models[mdl](inputs[mdl])
+                    else:
+                        current_outputs = self.models[mdl](*inputs[mdl])
                 else:
                     # Pass previous output:
                     # choice = np.random.randint(8)
@@ -1429,6 +1610,7 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                     #     current_outputs = self.models[mdl](inputs[mdl], torch.zeros_like(last_output))
                     # else:
                     # current_outputs = self.models[mdl](inputs[mdl], last_output)
+                    assert self.nb_inputs_per_model == 1
                     current_outputs = self.models[mdl](torch.cat((inputs[mdl], last_output), dim=1))
 
             # print("Mdl {}, memory {} - {}".format(mdl, torch.cuda.memory_allocated(0)/1000000, torch.cuda.memory_cached(0)/1000000,))
@@ -1829,10 +2011,12 @@ class GeneralizedAffinitiesFromEmb(nn.Module):
                 assert isinstance(ASPP_dilations, list) and all(isinstance(dil, list) for dil in ASPP_dilations)
                 ASPP_dilations = [tuple(dil) for dil in ASPP_dilations]
             aspp_module = ASPP3D(inplanes=output_maps, inner_planes=ASPP_inner_planes, dilations=ASPP_dilations, num_norm_groups=16)
+            raise NotImplementedError("Replace Conv3D with new Conv")
             final_conv = Conv3D(in_channels=ASPP_inner_planes, out_channels=nb_offsets,
                        kernel_size=1)
             self.final_module = nn.Sequential(aspp_module, final_conv)
         else:
+            raise NotImplementedError("Replace Conv3D with new Conv")
             self.final_module = nn.Sequential(
                 Conv3D(in_channels=output_maps, out_channels=nb_offsets,
                        kernel_size=(1, 5, 5))
