@@ -1398,9 +1398,9 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
             else:
                 current = encode(current)
             encoded_states.append(current)
-            current = downsample(current)
             if depth > 0:
                 log_image("encoder_layer_depth_{}".format(depth), current)
+            current = downsample(current)
         current = self.base_module(current)
         log_image("encoder_layer_depth_base", current)
 
@@ -1434,6 +1434,7 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
             return MergePyramidAndAutoCrop(self.decoder_fmaps[depth], self.encoder_fmaps[depth])
         else:
             return None
+
 
     def construct_embedding_heads(self, depth, nb_patch_net=None):
         assert nb_patch_net is not None
