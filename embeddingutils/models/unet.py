@@ -2059,6 +2059,80 @@ class GeneralizedAffinitiesFromEmb(nn.Module):
 
 
 
+class SmartAffinitiesFromEmb(nn.Module):
+    def __init__(self, path_model, prediction_indices, train_backbone=False, reload_backbone=True,
+                 ASPP_kwargs=None, layers_kwargs=None):
+        super(SmartAffinitiesFromEmb, self).__init__()
+
+        self.path_model = path_model
+        self.train_backbone = train_backbone
+        self.reload_backbone = reload_backbone
+        self.load_backbone()
+
+
+        self.prediction_indices = prediction_indices
+        output_maps = self.backbone_model.models[-1].output_fmaps * len(prediction_indices) * 2 + 3
+
+        # from vaeAffs.models.ASPP import ASPP3D
+        # aspp_module = ASPP3D(inplanes=output_maps, num_norm_groups=16, output_planes=1, **ASPP_kwargs)
+
+        # Build some 1x1 layers:
+        layers = [ConvNormActivation(in_channels=output_maps, **layers_kwargs)]
+        for _ in range(4):
+            layers.append(ConvNormActivation(in_channels=layers_kwargs["out_channels"], **layers_kwargs))
+
+        layers.append(ConvNormActivation(in_channels=layers_kwargs.get("out_channels"),
+                                         out_channels=1,
+                                         kernel_size=(1,1,1),
+                                         dim=3,
+                                         activation=None,
+                                         normalization=None))
+        self.final_module = nn.Sequential(*layers)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, *inputs):
+        inputs_backbone = inputs[:-1]
+
+        with torch.no_grad():
+            current = self.backbone_model(*inputs_backbone)
+        current = [current[idx] for idx in self.prediction_indices]
+        current = torch.cat(current, dim=1)
+        inverse_offset = tuple(-int(inputs[-1][0,i,0,0,0].item()) for i in range(3))
+        rolled_current = torch.roll(current, inverse_offset, dims=(2,3,4))
+        from speedrun.log_anywhere import log_image, log_embedding, log_scalar
+        log_image("concatenated_embs_0", current)
+        log_image("concatenated_embs_1", rolled_current)
+
+        current = torch.cat([auto_crop_tensor_to_shape(inputs[-1], current.shape),
+                             current,
+                             rolled_current], dim=1)
+
+        # from speedrun.log_anywhere import log_image, log_embedding, log_scalar
+        # if current.device == torch.device(0):
+        #     log_image("embeddings", current)
+
+        # Concatenate all channels:
+        current = self.final_module(current)
+        return self.sigmoid(current)
+
+    def load_state_dict(self, state_dict):
+        super(SmartAffinitiesFromEmb, self).load_state_dict(state_dict)
+        # Reload backbone:
+        if self.reload_backbone:
+            self.load_backbone()
+
+    def load_backbone(self):
+        self.backbone_model = torch.load(self.path_model)["_model"]
+
+        # Freeze-parameters for models that are not trained:
+        if not self.train_backbone:
+            print("Backbone parameters freezed!")
+            for param in self.backbone_model.parameters():
+                param.requires_grad = False
+
+
+
 
 class MaskUNet(UNet3D):
     def __init__(self, path_PyrUNet, *super_args, **super_kwargs):
