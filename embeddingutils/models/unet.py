@@ -972,9 +972,11 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
                  strided_res_blocks=False,
                  add_final_conv_in_res_block=False,
                  pre_kernel_size_res_block=(1,3,3),
+                 keep_raw=False,
                  **kwargs):
         # TODO: assert all this stuff
         self.strided_res_blocks = strided_res_blocks
+        self.keep_raw = keep_raw
         self.add_final_conv_in_res_block = add_final_conv_in_res_block
         self.depth = depth
         if isinstance(pre_kernel_size_res_block, list):
@@ -1064,6 +1066,7 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
 
 
     def forward(self, *inputs):
+        assert not self.keep_raw, "Not implemented yet at this level"
         # Modification for stacked architectures:
         # (previous output is inserted at depth 1)
         nb_inputs = len(inputs)
@@ -1427,6 +1430,9 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
 
         emb_outputs.reverse()
 
+        if self.keep_raw:
+            emb_outputs = emb_outputs + list(inputs)
+
         return emb_outputs
 
     def construct_merge_module(self, depth):
@@ -1505,6 +1511,7 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
         self.nb_inputs_per_model = nb_inputs_per_model
 
         # Collect models kwargs:
+        models_kwargs = deepcopy(models_kwargs)
         global_kwargs = models_kwargs.pop("global", {})
         self.models_kwargs = [deepcopy(global_kwargs) for _ in range(nb_stacked)]
         for mdl in range(nb_stacked):
