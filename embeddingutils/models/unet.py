@@ -1416,13 +1416,17 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
             current = merge(current, encoded_state)
             current = decode(current)
 
+            # FIXME: use reversed to make sure that they are outputed in the right order!
+            # Legacy problem, because previous networks are broken...
             if self.add_embedding_heads:
                 if str(depth) in self.emb_heads:
+                    # for emb_head in reversed(self.emb_heads[str(depth)]):
                     for emb_head in self.emb_heads[str(depth)]:
                         emb_out = emb_head(current)
                         emb_outputs.append(emb_out)
             else:
                 if depth in self.emb_slices:
+                    # for emb_slc in reversed(self.emb_slices[depth]):
                     for emb_slc in self.emb_slices[depth]:
                         emb_out = current[emb_slc[1]]
                         emb_outputs.append(emb_out)
@@ -1445,17 +1449,18 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
     def construct_embedding_heads(self, depth, nb_patch_net=None):
         assert nb_patch_net is not None
         ptch_kwargs = self.ptch_kwargs[nb_patch_net]
-        ASPP_kwargs = ptch_kwargs.get("ASPP_kwargs", {})
-        dilations = ASPP_kwargs.get("dilations", [[1,6,6], [1,12,12], [3,1,1]])
+        ASPP_kwargs = deepcopy(ptch_kwargs.get("ASPP_kwargs", {}))
+        dilations = ASPP_kwargs.pop("dilations", [[1,6,6], [1,12,12], [3,1,1]])
         assert isinstance(dilations, list) and all(isinstance(dil, list) for dil in dilations)
         dilations = [tuple(dil) for dil in dilations]
         from vaeAffs.models.ASPP import ASPP3D
-        ASPP_inner_planes = ASPP_kwargs.get("inner_planes", self.decoder_fmaps[depth])
+        ASPP_inner_planes = ASPP_kwargs.pop("inner_planes", self.decoder_fmaps[depth])
         aspp_module = ASPP3D(inplanes=self.decoder_fmaps[depth],
                              inner_planes=ASPP_inner_planes,
                              output_planes=ptch_kwargs["latent_variable_size"],
                              dilations=dilations,
-                             num_norm_groups=16)
+                             num_norm_groups=16,
+                             **ASPP_kwargs)
 
         crop = self.decoder_crops.get(depth, None)
         aspp_module = nn.Sequential(aspp_module, Crop(crop)) if crop is not None else aspp_module
