@@ -1355,7 +1355,7 @@ class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
                            kernel_size=scale_factor,
                            dim=3,
                            stride=scale_factor,
-                           dont_pad=True,
+                           valid_conv=True,
                            activation="ReLU",
                            num_groups_norm=16,
                            normalization="GroupNorm")
