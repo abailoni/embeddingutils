@@ -414,23 +414,27 @@ class PatchNet(nn.Module):
         self.linear_base = nn.Linear(latent_variable_size, self.vectorized_shape * feature_maps)
 
         self.upsampling = Upsample(scale_factor=downscaling_factor, mode="nearest")
+        # self.norm = nn.GroupNorm(num_channels=self.vectorized_shape * feature_maps, num_groups=feature_maps)
+        # self.relu = nn.ReLU()
 
-        assert feature_maps % 2 == 0, "Necessary for group norm"
+        # assert feature_maps % 2 == 0, "Necessary for group norm"
         self.feature_maps = feature_maps
         self.decoder_module = ResBlockAdvanced(feature_maps, f_inner=feature_maps,
                                                f_out=1,
                                                dim=3,
-                                               pre_kernel_size=(1, 3, 3),
+                                               pre_kernel_size=(3, 3, 3),
                                                inner_kernel_size=(3, 3, 3),
                                                activation="ReLU",
                                                normalization="GroupNorm",
-                                               num_groups_norm=2,
+                                               num_groups_norm=1,
                                                apply_final_activation=False,
                                                apply_final_normalization=False)
         self.final_activation = nn.Sigmoid()
 
     def forward(self, encoded_variable):
         x = self.linear_base(encoded_variable)
+        # x = self.norm(x)
+        # x = self.relu(x)
         N = x.shape[0]
         reshaped = x.view(N, -1, *self.min_path_shape)
 
@@ -1450,22 +1454,32 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
         assert nb_patch_net is not None
         ptch_kwargs = self.ptch_kwargs[nb_patch_net]
         ASPP_kwargs = deepcopy(ptch_kwargs.get("ASPP_kwargs", {}))
-        dilations = ASPP_kwargs.pop("dilations", [[1,6,6], [1,12,12], [3,1,1]])
-        assert isinstance(dilations, list) and all(isinstance(dil, list) for dil in dilations)
-        dilations = [tuple(dil) for dil in dilations]
-        from vaeAffs.models.ASPP import ASPP3D
-        ASPP_inner_planes = ASPP_kwargs.pop("inner_planes", self.decoder_fmaps[depth])
-        aspp_module = ASPP3D(inplanes=self.decoder_fmaps[depth],
-                             inner_planes=ASPP_inner_planes,
-                             output_planes=ptch_kwargs["latent_variable_size"],
-                             dilations=dilations,
-                             num_norm_groups=16,
-                             **ASPP_kwargs)
+        if ASPP_kwargs.pop("use_ASPP", True):
+            dilations = ASPP_kwargs.pop("dilations", [[1,6,6], [1,12,12], [3,1,1]])
+            assert isinstance(dilations, list) and all(isinstance(dil, list) for dil in dilations)
+            dilations = [tuple(dil) for dil in dilations]
+            from vaeAffs.models.ASPP import ASPP3D
+            ASPP_inner_planes = ASPP_kwargs.pop("inner_planes", self.decoder_fmaps[depth])
+            emb_head = ASPP3D(inplanes=self.decoder_fmaps[depth],
+                                 inner_planes=ASPP_inner_planes,
+                                 output_planes=ptch_kwargs["latent_variable_size"],
+                                 dilations=dilations,
+                                 num_norm_groups=16,
+                                 **ASPP_kwargs)
+        else:
+            norm = "GroupNorm" if ASPP_kwargs.get("apply_final_norm", True) else None
+            emb_head = ConvNormActivation(self.decoder_fmaps[depth],
+                                             out_channels=ptch_kwargs["latent_variable_size"],
+                                             kernel_size=1,
+                                             dim=3,
+                                             activation=ASPP_kwargs.get("final_act", "ReLU"),
+                                             normalization=norm,
+                                             num_groups_norm=16)
 
         crop = self.decoder_crops.get(depth, None)
-        aspp_module = nn.Sequential(aspp_module, Crop(crop)) if crop is not None else aspp_module
+        emb_head = nn.Sequential(emb_head, Crop(crop)) if crop is not None else emb_head
 
-        return aspp_module
+        return emb_head
 
     def construct_encoder_module(self, depth):
         if depth == 0:
