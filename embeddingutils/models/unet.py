@@ -388,6 +388,8 @@ class PatchNet(nn.Module):
                  output_shape=(5, 29, 29),
                  downscaling_factor=(1, 2, 2),
                  feature_maps=16,
+                 legacy=False,
+                 legacy_resblock=None,
                  **extra_kwargs):
         super(PatchNet, self).__init__()
 
@@ -417,16 +419,24 @@ class PatchNet(nn.Module):
         # self.norm = nn.GroupNorm(num_channels=self.vectorized_shape * feature_maps, num_groups=feature_maps)
         # self.relu = nn.ReLU()
 
+        # Legacy:
+        pre_kernel_size = (3, 3, 3)
+        num_groups_norm = 1
+        if legacy:
+            pre_kernel_size = (1, 3, 3)
+            num_groups_norm = 2
+
         # assert feature_maps % 2 == 0, "Necessary for group norm"
         self.feature_maps = feature_maps
         self.decoder_module = ResBlockAdvanced(feature_maps, f_inner=feature_maps,
                                                f_out=1,
                                                dim=3,
-                                               pre_kernel_size=(3, 3, 3),
+                                               pre_kernel_size=pre_kernel_size,
                                                inner_kernel_size=(3, 3, 3),
                                                activation="ReLU",
                                                normalization="GroupNorm",
-                                               num_groups_norm=1,
+                                               num_groups_norm=num_groups_norm,
+                                               legacy_version=legacy_resblock,
                                                apply_final_activation=False,
                                                apply_final_normalization=False)
         self.final_activation = nn.Sigmoid()
@@ -976,12 +986,14 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
                  strided_res_blocks=False,
                  add_final_conv_in_res_block=False,
                  pre_kernel_size_res_block=(1,3,3),
+                 legacy_resblock=None,
                  keep_raw=False,
                  **kwargs):
         # TODO: assert all this stuff
         self.strided_res_blocks = strided_res_blocks
         self.keep_raw = keep_raw
         self.add_final_conv_in_res_block = add_final_conv_in_res_block
+        self.legacy_resblock = legacy_resblock
         self.depth = depth
         if isinstance(pre_kernel_size_res_block, list):
             pre_kernel_size_res_block = tuple(pre_kernel_size_res_block)
@@ -1171,7 +1183,8 @@ class GeneralizedFeaturePyramidUNet3D(FeaturePyramidUNet3D):
                                      activation="ReLU",
                                      normalization="GroupNorm",
                                      num_groups_norm=16,
-                                                        add_final_conv=self.add_final_conv_in_res_block
+                                                        add_final_conv=self.add_final_conv_in_res_block,
+                                                        legacy_version=self.legacy_resblock
                                      ))
                 else:
                     blocks_list.append(ResBlockAdvanced(f_in, f_inner=f_out, pre_kernel_size=(1, 3, 3),

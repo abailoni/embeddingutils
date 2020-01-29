@@ -86,6 +86,7 @@ class ResBlockAdvanced(nn.Module):
                  apply_final_normalization=True,
                  upsampling_factor=None,
                  add_final_conv=False,
+                 legacy_version=None,
                  dilation=1):
         super(ResBlockAdvanced, self).__init__()
         f_inner = f_in if f_inner is None else f_inner
@@ -93,10 +94,18 @@ class ResBlockAdvanced(nn.Module):
 
         self.apply_final_activation = apply_final_activation
         self.apply_final_normalization = apply_final_normalization
+        self.legacy_version = legacy_version
 
         self.skip_con = None
         if stride != 1 or f_in != f_out:
-            self.skip_con = ConvNormActivation(f_in, f_out, kernel_size=1, dim=dim,
+            if self.legacy_version == "0.9":
+                self.skip_con = ConvNormActivation(f_inner, f_out, kernel_size=1, dim=dim,
+                                                   activation=activation,
+                                                   stride=stride,
+                                                   num_groups_norm=num_groups_norm,
+                                                   normalization=normalization)
+            else:
+                self.skip_con = ConvNormActivation(f_in, f_out, kernel_size=1, dim=dim,
                                                activation=activation,
                                                stride=stride,
                                                num_groups_norm=num_groups_norm,
@@ -142,13 +151,21 @@ class ResBlockAdvanced(nn.Module):
             self.upsampling = Upsample(scale_factor=upsampling_factor, mode="nearest")
 
     def forward(self, input):
-        skip_conn = input
-        if self.skip_con is not None:
-            skip_conn = self.skip_con.conv(skip_conn)
-        x = self.conv1(input)
-        # skip_conn = self.conv1.conv(input)
-        # x = self.conv1.normalization(skip_conn) if self.conv1.normalization is not None else skip_conn
-        # x = self.conv1.activation(x) if self.conv1.activation is not None else x
+        if self.legacy_version == "0.9":
+            skip_conn = self.conv1.conv(input)
+            x = self.conv1.normalization(skip_conn) if self.conv1.normalization is not None else skip_conn
+            x = self.conv1.activation(x) if self.conv1.activation is not None else x
+            if self.skip_con is not None:
+                # Take the output of conv1 (including norm and act) and apply 1x1 conv:
+                skip_conn = self.skip_con.conv(x)
+        else:
+            skip_conn = input
+            if self.skip_con is not None:
+                skip_conn = self.skip_con.conv(skip_conn)
+            x = self.conv1(input)
+            # skip_conn = self.conv1.conv(input)
+            # x = self.conv1.normalization(skip_conn) if self.conv1.normalization is not None else skip_conn
+            # x = self.conv1.activation(x) if self.conv1.activation is not None else x
         x = self.conv2(x)
         x = self.conv3.conv(x)
         x = x + skip_conn
