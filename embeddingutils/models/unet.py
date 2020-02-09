@@ -1384,6 +1384,7 @@ class GeneralizedUNet3D(GeneralizedFeaturePyramidUNet3D):
 class MultiScaleInputsUNet3D(GeneralizedUNet3D):
     def __init__(self,
                  *super_args,
+                 add_foreground_prediction_module=False,
                  **super_kwargs):
         """
         The crops in the decode have been moved after ASPP, so that we leave the big context available
@@ -1392,6 +1393,25 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
 
         # Construct the extra modules:
         self.autopad_first_encoding = AutoPad()
+
+
+        self.add_foreground_prediction_module = add_foreground_prediction_module
+        self.foreground_module = None
+        if add_foreground_prediction_module:
+            # self.foreground_module = nn.Sequential(
+            #     ConvNormActivation(in_channels=self.models[-1].output_fmaps, out_channels=int(self.models[-1].output_fmaps/4),
+            #                kernel_size=(1, 3, 3), dim=3, activation='ReLU', normalization="GroupNorm", num_groups_norm=16),
+            #     ConvNormActivation(in_channels=int(self.models[-1].output_fmaps/4), out_channels=1,
+            #                        kernel_size=(1, 3, 3), dim=3, activation='Sigmoid', normalization=None))
+
+            self.foreground_module = ConvNormActivation(self.decoder_fmaps[0],
+                                          out_channels=1,
+                                          kernel_size=1,
+                                          dim=3,
+                                          activation='Sigmoid',
+                                          normalization=None,
+                                          num_groups_norm=16)
+
 
 
 
@@ -1450,6 +1470,9 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
 
 
         emb_outputs.reverse()
+
+        if self.foreground_module is not None:
+            emb_outputs.append(self.foreground_module(current))
 
         if self.keep_raw:
             emb_outputs = emb_outputs + list(inputs)
@@ -1532,7 +1555,6 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                  models_kwargs,
                  models_to_train,
                  stacked_upscl_fact=None,
-                 add_foreground_prediction_module=False,
                  type_of_model="GeneralizedFeaturePyramidUNet3D",
                  detach_stacked_models=True,
                  nb_inputs_per_model=1
@@ -1607,14 +1629,6 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
             Upsample(scale_factor=tuple(scl_fact), mode="nearest") for scl_fact in self.stacked_upscl_fact
         ])
 
-
-        self.add_foreground_prediction_module = add_foreground_prediction_module
-        if add_foreground_prediction_module:
-            self.foreground_module = nn.Sequential(
-                ConvNormActivation(in_channels=self.models[-1].output_fmaps, out_channels=int(self.models[-1].output_fmaps/4),
-                           kernel_size=(1, 3, 3), dim=3, activation='ReLU', normalization="GroupNorm", num_groups_norm=16),
-                ConvNormActivation(in_channels=int(self.models[-1].output_fmaps/4), out_channels=1,
-                                   kernel_size=(1, 3, 3), dim=3, activation='Sigmoid', normalization=None))
 
         # TODO: not sure it changes anything...
         self.fix_batchnorm_problem()
