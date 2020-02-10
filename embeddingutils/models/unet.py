@@ -1385,10 +1385,12 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
     def __init__(self,
                  *super_args,
                  add_foreground_prediction_module=False,
+                 number_multiscale_inputs=2,
                  **super_kwargs):
         """
         The crops in the decode have been moved after ASPP, so that we leave the big context available
         """
+        self.number_multiscale_inputs = number_multiscale_inputs
         super(MultiScaleInputsUNet3D, self).__init__(*super_args, **super_kwargs)
 
         # Construct the extra modules:
@@ -1417,23 +1419,23 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
 
     def forward(self, *inputs):
         nb_inputs = len(inputs)
-        assert nb_inputs == 2, "Only two inputs accepted for the moment"
+        assert nb_inputs == self.number_multiscale_inputs, "Only two inputs accepted for the moment"
 
         encoded_states = []
         current = inputs[0]
         for encode, downsample, depth in zip(self.encoder_modules, self.downsampling_modules,
                                       range(self.depth)):
             from speedrun.log_anywhere import log_image, log_embedding, log_scalar
-            if depth == 1:
-                current_lvl0_padded = self.autopad_first_encoding(current, inputs[1].shape)
+            if depth > 0 and depth < self.number_multiscale_inputs:
+                current_lvl_padded = self.autopad_first_encoding(current, inputs[depth].shape)
                 # -------- DEBUG -----------
                 # TODO: pad input and check if it fits...
-                inputs_DS = inputs[0][:,:,:,::2,::2]
-                inputs_DS_padded = self.autopad_first_encoding(inputs_DS, inputs[1].shape)
-                log_image("input_ds", inputs_DS_padded)
-                log_image("mid_layer", current_lvl0_padded)
+                # inputs_DS = inputs[0][:,:,:,::2,::2]
+                # inputs_DS_padded = self.autopad_first_encoding(inputs_DS, inputs[1].shape)
+                # log_image("input_ds", inputs_DS_padded)
+                # log_image("mid_layer", current_lvl0_padded)
                 # -------- DEBUG -----------
-                current = torch.cat((current_lvl0_padded, inputs[1]), dim=1)
+                current = torch.cat((current_lvl_padded, inputs[depth]), dim=1)
                 current = encode(current)
             else:
                 current = encode(current)
@@ -1520,7 +1522,7 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
     def construct_encoder_module(self, depth):
         if depth == 0:
             f_in = self.in_channels
-        elif depth == 1:
+        elif depth < self.number_multiscale_inputs:
             f_in = self.encoder_fmaps[depth - 1] + self.in_channels
         else:
             f_in = self.encoder_fmaps[depth - 1]
