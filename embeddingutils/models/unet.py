@@ -2131,6 +2131,72 @@ class GeneralizedAffinitiesFromEmb(nn.Module):
 
 
 
+
+class AffinitiesFromEmb(nn.Module):
+    def __init__(self, path_backbone,
+                 nb_offsets,
+                 prediction_indices,
+                 final_layer_kwargs=None,
+                 train_backbone=False,
+                 reload_backbone=True,
+                 **stacked_model_super_kwargs):
+        super(AffinitiesFromEmb, self).__init__()
+
+        self.path_backbone = path_backbone
+        self.stacked_model_super_kwargs = stacked_model_super_kwargs
+        self.train_backbone = train_backbone
+        self.reload_backbone = reload_backbone
+        self.load_backbone()
+
+
+        self.prediction_indices = prediction_indices
+        output_maps = self.backbone_model.models[-1].output_fmaps * len(prediction_indices)
+
+        # Build some 1x1 layers:
+        layers = [ConvNormActivation(in_channels=output_maps,
+                                     out_channels=int(output_maps/2),
+                                     **final_layer_kwargs)]
+        # for _ in range(4):
+        #     layers.append(ConvNormActivation(in_channels=final_layer_kwargs["out_channels"], **final_layer_kwargs))
+
+        layers.append(ConvNormActivation(in_channels=int(output_maps/2),
+                                         out_channels=nb_offsets,
+                                         kernel_size=(1,1,1),
+                                         dim=3,
+                                         activation="Sigmoid",
+                                         normalization=None))
+        self.final_module = nn.Sequential(*layers)
+
+    def forward(self, *inputs):
+        with torch.no_grad():
+            current = self.backbone_model(*inputs)
+
+        # Concatenate predictions:
+        current = [current[idx] for idx in self.prediction_indices]
+        current = torch.cat(current, dim=1)
+
+        current = self.final_module(current)
+        return current
+
+    def load_state_dict(self, state_dict):
+        super(AffinitiesFromEmb, self).load_state_dict(state_dict)
+        # Reload backbone:
+        if self.reload_backbone:
+            self.load_backbone()
+
+    def load_backbone(self):
+        self.backbone_model = GeneralizedStackedPyramidUNet3D(**self.stacked_model_super_kwargs)
+        state_dict = torch.load(self.path_backbone)["_model"].state_dict()
+        self.backbone_model.load_state_dict(state_dict)
+
+        # Freeze-parameters for models that are not trained:
+        if not self.train_backbone:
+            print("Backbone parameters freezed!")
+            for param in self.backbone_model.parameters():
+                param.requires_grad = False
+
+
+
 class SmartAffinitiesFromEmb(nn.Module):
     def __init__(self, path_model, prediction_indices, train_backbone=False, reload_backbone=True,
                  ASPP_kwargs=None, layers_kwargs=None):
@@ -2200,10 +2266,6 @@ class SmartAffinitiesFromEmb(nn.Module):
         # Freeze-parameters for models that are not trained:
         if not self.train_backbone:
             print("Backbone parameters freezed!")
-            for param in self.backbone_model.parameters():
-                param.requires_grad = False
-
-
 
 
 class MaskUNet(UNet3D):
