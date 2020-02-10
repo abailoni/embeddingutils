@@ -14,6 +14,7 @@ from copy import deepcopy
 from inferno.extensions.layers.convolutional import ConvNormActivation
 
 import numpy as np
+import ast
 
 # TODO: support residual U-Net, Hourglass-Net, 2D Versions, stacked Versions
 
@@ -1385,6 +1386,7 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
     def __init__(self,
                  *super_args,
                  add_foreground_prediction_module=False,
+                 foreground_prediction_kwargs=None,
                  number_multiscale_inputs=2,
                  **super_kwargs):
         """
@@ -1398,24 +1400,32 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
 
 
         self.add_foreground_prediction_module = add_foreground_prediction_module
+        self.foreground_prediction_kwargs = foreground_prediction_kwargs
         self.foreground_module = None
         if add_foreground_prediction_module:
-            # self.foreground_module = nn.Sequential(
-            #     ConvNormActivation(in_channels=self.models[-1].output_fmaps, out_channels=int(self.models[-1].output_fmaps/4),
-            #                kernel_size=(1, 3, 3), dim=3, activation='ReLU', normalization="GroupNorm", num_groups_norm=16),
-            #     ConvNormActivation(in_channels=int(self.models[-1].output_fmaps/4), out_channels=1,
-            #                        kernel_size=(1, 3, 3), dim=3, activation='Sigmoid', normalization=None))
-
-            self.foreground_module = ConvNormActivation(self.decoder_fmaps[0],
+            if self.foreground_prediction_kwargs is None:
+                self.foreground_module = ConvNormActivation(self.decoder_fmaps[0],
                                           out_channels=1,
                                           kernel_size=1,
                                           dim=3,
                                           activation='Sigmoid',
                                           normalization=None,
                                           num_groups_norm=16)
+            else:
+                frg_kwargs = foreground_prediction_kwargs
+                foreground_modules = {}
+                for depth in frg_kwargs:
+                    depth = ast.literal_eval(depth)
+                    assert "nb_target" in frg_kwargs[depth]
+                    foreground_modules[depth] = ConvNormActivation(self.decoder_fmaps[depth],
+                                           out_channels=1,
+                                           kernel_size=1,
+                                           dim=3,
+                                           activation='Sigmoid',
+                                           normalization=None,
+                                           num_groups_norm=16)
 
-
-
+                self.foreground_module = nn.ModuleDict(foreground_modules)
 
     def forward(self, *inputs):
         nb_inputs = len(inputs)
@@ -1447,6 +1457,7 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
         log_image("encoder_layer_depth_base", current)
 
         emb_outputs = []
+        forgr_outputs = []
         for encoded_state, upsample, skip, merge, decode, depth in reversed(list(zip(
                 encoded_states, self.upsampling_modules, self.skip_modules, self.merge_modules, self.decoder_modules, range(len(self.decoder_modules))))):
             if depth < self.stop_decoder_at_depth:
@@ -1470,11 +1481,17 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
                         emb_out = current[emb_slc[1]]
                         emb_outputs.append(emb_out)
 
+            if isinstance(self.foreground_module, nn.ModuleDict):
+                if depth in self.foreground_module:
+                    forgr_outputs.append(self.foreground_module[depth](current))
+            elif depth == 0:
+                forgr_outputs.append(self.foreground_module(current))
+
+
 
         emb_outputs.reverse()
-
-        if self.foreground_module is not None:
-            emb_outputs.append(self.foreground_module(current))
+        forgr_outputs.reverse()
+        emb_outputs = emb_outputs + forgr_outputs
 
         if self.keep_raw:
             emb_outputs = emb_outputs + list(inputs)
