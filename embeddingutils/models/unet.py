@@ -2139,6 +2139,7 @@ class AffinitiesFromEmb(nn.Module):
                  final_layer_kwargs=None,
                  train_backbone=False,
                  reload_backbone=True,
+                 nb_extra_final_layers=0,
                  **stacked_model_super_kwargs):
         super(AffinitiesFromEmb, self).__init__()
 
@@ -2156,8 +2157,10 @@ class AffinitiesFromEmb(nn.Module):
         layers = [ConvNormActivation(in_channels=output_maps,
                                      out_channels=int(output_maps/2),
                                      **final_layer_kwargs)]
-        # for _ in range(4):
-        #     layers.append(ConvNormActivation(in_channels=final_layer_kwargs["out_channels"], **final_layer_kwargs))
+        for _ in range(nb_extra_final_layers):
+            layers.append(ConvNormActivation(in_channels=int(output_maps/2),
+                                             out_channels=int(output_maps/2),
+                                             **final_layer_kwargs))
 
         layers.append(ConvNormActivation(in_channels=int(output_maps/2),
                                          out_channels=nb_offsets,
