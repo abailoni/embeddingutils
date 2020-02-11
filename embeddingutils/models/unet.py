@@ -1523,11 +1523,13 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
                                  **ASPP_kwargs)
         else:
             norm = "GroupNorm" if ASPP_kwargs.get("apply_final_norm", True) else None
+            apply_final_act = ASPP_kwargs.pop("apply_final_act", True)
+            final_act = ASPP_kwargs.get("final_act", "ReLU") if apply_final_act else None
             emb_head = ConvNormActivation(self.decoder_fmaps[depth],
                                              out_channels=ptch_kwargs["latent_variable_size"],
                                              kernel_size=1,
                                              dim=3,
-                                             activation=ASPP_kwargs.get("final_act", "ReLU"),
+                                             activation=final_act,
                                              normalization=norm,
                                              num_groups_norm=16)
 
@@ -2140,6 +2142,8 @@ class AffinitiesFromEmb(nn.Module):
                  train_backbone=False,
                  reload_backbone=True,
                  nb_extra_final_layers=0,
+                 nb_channels_final_layers=None,
+                 nb_channels_output_emb=None,
                  **stacked_model_super_kwargs):
         super(AffinitiesFromEmb, self).__init__()
 
@@ -2151,18 +2155,20 @@ class AffinitiesFromEmb(nn.Module):
 
 
         self.prediction_indices = prediction_indices
-        output_maps = self.backbone_model.models[-1].output_fmaps * len(prediction_indices)
+        output_maps = nb_channels_output_emb if nb_channels_output_emb is not None else \
+            self.backbone_model.models[-1].output_fmaps * len(prediction_indices)
+        nb_channels_final_layers = nb_channels_final_layers if nb_channels_final_layers is not None else int(output_maps/2)
 
         # Build some 1x1 layers:
         layers = [ConvNormActivation(in_channels=output_maps,
-                                     out_channels=int(output_maps/2),
+                                     out_channels=nb_channels_final_layers,
                                      **final_layer_kwargs)]
         for _ in range(nb_extra_final_layers):
-            layers.append(ConvNormActivation(in_channels=int(output_maps/2),
-                                             out_channels=int(output_maps/2),
+            layers.append(ConvNormActivation(in_channels=nb_channels_final_layers,
+                                             out_channels=nb_channels_final_layers,
                                              **final_layer_kwargs))
 
-        layers.append(ConvNormActivation(in_channels=int(output_maps/2),
+        layers.append(ConvNormActivation(in_channels=nb_channels_final_layers,
                                          out_channels=nb_offsets,
                                          kernel_size=(1,1,1),
                                          dim=3,
