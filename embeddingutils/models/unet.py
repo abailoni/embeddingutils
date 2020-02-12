@@ -2132,6 +2132,48 @@ class GeneralizedAffinitiesFromEmb(nn.Module):
                 param.requires_grad = False
 
 
+class PredictForegroundFromStackedModel(GeneralizedStackedPyramidUNet3D):
+    # FIXME: should be a subclass of UNetMultiInput
+    def __init__(self,
+                 keep_only_first_foreground=True,
+                 **super_kwargs):
+        super(PredictForegroundFromStackedModel, self).__init__(**super_kwargs)
+
+        last_model = self.models[-1]
+
+        assert last_model.foreground_module is not None
+        if isinstance(last_model.foreground_module, nn.ModuleDict):
+            nb_foreground_pred = len(last_model.foreground_module)
+        else :
+            nb_foreground_pred = 1
+
+        assert isinstance(last_model.emb_heads, nn.ModuleDict)
+        nb_emb_pred = 0
+        for depth in last_model.emb_heads:
+            nb_emb_pred += len(last_model.emb_heads[depth])
+
+        self.nb_emb_pred = nb_emb_pred
+        self.keep_only_first_foreground = keep_only_first_foreground
+        self.nb_foreground_pred = nb_foreground_pred
+        self.nb_raw = last_model.number_multiscale_inputs if last_model.keep_raw else 0
+
+        # Freeze parameters model:
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, *inputs):
+        with torch.no_grad():
+            predictions = super(PredictForegroundFromStackedModel, self).forward(*inputs)
+
+        foreground_preds = predictions[self.nb_emb_pred:]
+        if self.keep_only_first_foreground:
+            foreground_preds = foreground_preds[0]
+        else:
+            if self.nb_raw != 0:
+                foreground_preds = foreground_preds[:-self.nb_raw]
+
+        return foreground_preds
+
 
 
 class AffinitiesFromEmb(nn.Module):
