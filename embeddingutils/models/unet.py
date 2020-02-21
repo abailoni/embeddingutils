@@ -1388,6 +1388,7 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
                  add_foreground_prediction_module=False,
                  foreground_prediction_kwargs=None,
                  number_multiscale_inputs=2,
+                 fix_patch_ordering=False,
                  **super_kwargs):
         """
         The crops in the decode have been moved after ASPP, so that we leave the big context available
@@ -1400,6 +1401,7 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
 
 
         self.add_foreground_prediction_module = add_foreground_prediction_module
+        self.fix_patch_ordering = fix_patch_ordering
         self.foreground_prediction_kwargs = foreground_prediction_kwargs
         self.foreground_module = None
         if add_foreground_prediction_module:
@@ -1415,9 +1417,8 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
                 frg_kwargs = foreground_prediction_kwargs
                 foreground_modules = {}
                 for depth in frg_kwargs:
-                    depth = ast.literal_eval(depth)
                     assert "nb_target" in frg_kwargs[depth]
-                    foreground_modules[depth] = ConvNormActivation(self.decoder_fmaps[depth],
+                    foreground_modules[str(depth)] = ConvNormActivation(self.decoder_fmaps[depth],
                                            out_channels=1,
                                            kernel_size=1,
                                            dim=3,
@@ -1470,20 +1471,21 @@ class MultiScaleInputsUNet3D(GeneralizedUNet3D):
             # Legacy problem, because previous networks are broken...
             if self.add_embedding_heads:
                 if str(depth) in self.emb_heads:
-                    # for emb_head in reversed(self.emb_heads[str(depth)]):
-                    for emb_head in self.emb_heads[str(depth)]:
+                    all_emb_heads = reversed(self.emb_heads[str(depth)]) if self.fix_patch_ordering else self.emb_heads[str(depth)]
+                    for emb_head in all_emb_heads:
                         emb_out = emb_head(current)
                         emb_outputs.append(emb_out)
             else:
                 if depth in self.emb_slices:
+                    all_slices = reversed(self.emb_slices[depth]) if self.fix_patch_ordering else self.emb_slices[depth]
                     # for emb_slc in reversed(self.emb_slices[depth]):
-                    for emb_slc in self.emb_slices[depth]:
+                    for emb_slc in all_slices:
                         emb_out = current[emb_slc[1]]
                         emb_outputs.append(emb_out)
 
             if isinstance(self.foreground_module, nn.ModuleDict):
-                if depth in self.foreground_module:
-                    forgr_outputs.append(self.foreground_module[depth](current))
+                if str(depth) in self.foreground_module:
+                    forgr_outputs.append(self.foreground_module[str(depth)](current))
             elif depth == 0:
                 forgr_outputs.append(self.foreground_module(current))
 
