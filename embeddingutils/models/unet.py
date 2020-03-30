@@ -2192,6 +2192,7 @@ class AffinitiesFromEmb(nn.Module):
         super(AffinitiesFromEmb, self).__init__()
 
         self.path_backbone = path_backbone
+        stacked_model_super_kwargs.pop('slicing_config', None)
         self.stacked_model_super_kwargs = stacked_model_super_kwargs
         self.train_backbone = train_backbone
         self.reload_backbone = reload_backbone
