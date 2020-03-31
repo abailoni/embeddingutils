@@ -328,11 +328,10 @@ class EncoderDecoderSkeleton(nn.Module):
 
 
 
-class MultiScaleInputsUNet3D(EncoderDecoderSkeleton):
+class MultiScaleInputsUNet3DLegacy(EncoderDecoderSkeleton):
     def __init__(self, depth,
                  in_channels,
                  encoder_fmaps,
-                 add_foreground_prediction_module=False,
                  foreground_prediction_kwargs=None,
                  number_multiscale_inputs=1,
                  decoder_fmaps=None,
@@ -423,7 +422,7 @@ class MultiScaleInputsUNet3D(EncoderDecoderSkeleton):
         assert len(self.decoder_crops) <= depth, "For the moment maximum one crop is supported"
 
         # Build the skeleton:
-        super(MultiScaleInputsUNet3D, self).__init__(depth)
+        super(MultiScaleInputsUNet3DLegacy, self).__init__(depth)
 
         # Build patchNets:
         global_kwargs = patchNet_kwargs.pop("global", {})
@@ -447,36 +446,37 @@ class MultiScaleInputsUNet3D(EncoderDecoderSkeleton):
             {str(dpth): nn.ModuleList(emb_heads[dpth]) for dpth in emb_heads}
         )
 
-        self.autopad_first_encoding = AutoPad() if number_multiscale_inputs > 1 else None
+        self.autopad_feature_maps = AutoPad() if number_multiscale_inputs > 1 else None
 
-        self.add_foreground_prediction_module = add_foreground_prediction_module
-        self.foreground_prediction_kwargs = foreground_prediction_kwargs
+        self.foreground_prediction_kwargs = foreground_prediction_kwargs \
+            if foreground_prediction_kwargs is not None else {}
+
         self.foreground_module = None
-        if add_foreground_prediction_module:
-            if self.foreground_prediction_kwargs is None:
-                self.foreground_module = ConvNormActivation(self.decoder_fmaps[0],
-                                          out_channels=1,
-                                          kernel_size=1,
-                                          dim=3,
-                                          activation='Sigmoid',
-                                          normalization=None,
-                                          num_groups_norm=16)
-            else:
-                frg_kwargs = foreground_prediction_kwargs
-                foreground_modules = {}
-                for depth in frg_kwargs:
-                    assert "nb_target" in frg_kwargs[depth]
-                    foreground_modules[str(depth)] = ConvNormActivation(self.decoder_fmaps[depth],
-                                           out_channels=1,
-                                           kernel_size=1,
-                                           dim=3,
-                                           activation='Sigmoid',
-                                           normalization=None,
-                                           num_groups_norm=16)
+        if len(self.foreground_prediction_kwargs) > 0:
+            frg_kwargs = self.foreground_prediction_kwargs
+            foreground_modules = {}
+            for depth in frg_kwargs:
+                assert "nb_target" in frg_kwargs[depth]
+                foreground_modules[str(depth)] = ConvNormActivation(self.decoder_fmaps[depth],
+                                       out_channels=1,
+                                       kernel_size=1,
+                                       dim=3,
+                                       activation='Sigmoid',
+                                       normalization=None,
+                                       num_groups_norm=16)
 
-                self.foreground_module = nn.ModuleDict(foreground_modules)
+            self.foreground_module = nn.ModuleDict(foreground_modules)
 
+        self.properly_init_normalizations()
 
+    def properly_init_normalizations(self):
+        """
+        This was sometimes mentioned online as a trick to avoid norm. init problems
+        """
+        for m in self.modules():
+            if isinstance(m, (nn.BatchNorm3d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
     @property
     def dim(self):
@@ -587,7 +587,7 @@ class MultiScaleInputsUNet3D(EncoderDecoderSkeleton):
         for encode, downsample, depth in zip(self.encoder_modules, self.downsampling_modules,
                                       range(self.depth)):
             if depth > 0 and depth < self.number_multiscale_inputs:
-                current_lvl_padded = self.autopad_first_encoding(current, inputs[depth].shape)
+                current_lvl_padded = self.autopad_feature_maps(current, inputs[depth].shape)
                 current = torch.cat((current_lvl_padded, inputs[depth]), dim=1)
                 current = encode(current)
             else:
@@ -714,8 +714,8 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                 self.models_kwargs[mdl].update(models_kwargs[mdl])
 
         # Build models (now PatchNets are also automatically built here):
-        if type_of_model == "MultiScaleInputsUNet3D":
-            model_class = MultiScaleInputsUNet3D
+        if type_of_model == "MultiScaleInputsUNet3DLegacy":
+            model_class = MultiScaleInputsUNet3DLegacy
         else:
             raise ValueError
         self.type_of_model = type_of_model
@@ -764,15 +764,6 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
         ])
 
 
-        # TODO: not sure it changes anything...
-        self.fix_batchnorm_problem()
-        self.first_debug_print = True
-
-    def fix_batchnorm_problem(self):
-        for m in self.modules():
-            if isinstance(m, (nn.BatchNorm3d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, *inputs):
         assert len(inputs) == self.nb_stacked * self.nb_inputs_per_model
