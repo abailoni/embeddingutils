@@ -179,7 +179,6 @@ class PatchNetVAE(nn.Module):
     def generate(self, shape):
         return torch.randn(shape)
 
-
     def forward(self, input):
         if self.pre_maxpool is not None:
             input = self.pre_maxpool(input)
@@ -327,14 +326,13 @@ class EncoderDecoderSkeleton(nn.Module):
         return Identity()
 
 
-
-class MultiScaleInputsUNet3DLegacy(EncoderDecoderSkeleton):
+class MultiScaleInputsUNet3D(EncoderDecoderSkeleton):
     def __init__(self, depth,
                  in_channels,
                  encoder_fmaps,
+                 decoder_fmaps=None,
                  foreground_prediction_kwargs=None,
                  number_multiscale_inputs=1,
-                 decoder_fmaps=None,
                  scale_factor=2,
                  res_blocks_specs=None,
                  res_blocks_specs_decoder=None,
@@ -343,6 +341,19 @@ class MultiScaleInputsUNet3DLegacy(EncoderDecoderSkeleton):
                  decoder_crops=None,
                  return_input=False):
         """
+        Generalized UNet model with the following features:
+
+         - Sum of skip-connections (no concatenation)
+         - Downscale with strided conv
+         - Attach one or more output-branches at any level of the UNet decoder
+                (each branch requires the number of output channels and the final activation)
+         - Optionally, pass multiple inputs at different scales. Features at different levels of
+                the UNet encoder are auto-padded and concatenated to the given inputs.
+         - Optionally, perform spatial-crops in the UNet decoder to save memory and crop boundary artifacts
+                (skip-connections are automatically cropped to match)
+         - Custom number of 2D or 3D residual blocks at different levels of the UNet hierarchy
+
+
         :param res_blocks_specs: None or list of booleans (lenght depth+1) specifying how many resBlocks we should concatenate
         at each level. Example:
             [
@@ -422,7 +433,7 @@ class MultiScaleInputsUNet3DLegacy(EncoderDecoderSkeleton):
         assert len(self.decoder_crops) <= depth, "For the moment maximum one crop is supported"
 
         # Build the skeleton:
-        super(MultiScaleInputsUNet3DLegacy, self).__init__(depth)
+        super(MultiScaleInputsUNet3D, self).__init__(depth)
 
         # Build patchNets:
         global_kwargs = patchNet_kwargs.pop("global", {})
@@ -714,8 +725,8 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                 self.models_kwargs[mdl].update(models_kwargs[mdl])
 
         # Build models (now PatchNets are also automatically built here):
-        if type_of_model == "MultiScaleInputsUNet3DLegacy":
-            model_class = MultiScaleInputsUNet3DLegacy
+        if type_of_model == "MultiScaleInputsUNet3D":
+            model_class = MultiScaleInputsUNet3D
         else:
             raise ValueError
         self.type_of_model = type_of_model
@@ -752,10 +763,8 @@ class GeneralizedStackedPyramidUNet3D(nn.Module):
                     param.requires_grad = False
 
         # # Build crop-modules:
-        # from vaeAffs.transforms import DownsampleAndCrop3D
         # self.downscale_and_crop = downscale_and_crop if downscale_and_crop is not None else {}
         # # TODO: deprecated (now an auto-crop is used)
-        # self.crop_transforms = {mdl: DownsampleAndCrop3D(**self.downscale_and_crop[mdl]) for mdl in self.downscale_and_crop}
 
         self.stacked_upscl_fact = stacked_upscl_fact if stacked_upscl_fact is not None else []
         assert len(self.stacked_upscl_fact) == self.nb_stacked - 1
